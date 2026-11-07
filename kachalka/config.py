@@ -8,6 +8,11 @@ from pathlib import Path
 
 APP_DIR = Path(os.environ.get("KACHALKA_HOME", Path.home() / "Library/Application Support/Kachalka"))
 SOCKET = APP_DIR / "kachalka.sock"
+if len(os.fsencode(SOCKET)) > 100:  # у macOS предел пути Unix-сокета 104 байта
+    import hashlib
+    import tempfile
+    _tag = hashlib.sha1(os.fsencode(APP_DIR)).hexdigest()[:10]
+    SOCKET = Path(tempfile.gettempdir()) / f"kachalka-{os.getuid()}-{_tag}.sock"
 DB_PATH = APP_DIR / "history.sqlite3"
 RESUME_DIR = APP_DIR / "resume"
 TORRENTS_DIR = APP_DIR / "torrents"

@@ -67,7 +67,17 @@ def render(cli: str) -> str:
 
     for t in torrents:
         name = _clean(t["name"])
+        # Управление — подменю у строки с названием
         out.append(f"{name[:60]} | size=13")
+        target = str(Path(t["save_path"]) / t["name"])
+        if t["paused"]:
+            out.append("--" + action(cli, "Продолжить", "resume", t["id"]))
+        else:
+            out.append("--" + action(cli, "Пауза", "pause", t["id"]))
+        out.append("--" + action(cli, "Показать в Finder", "reveal", target, refresh=False))
+        out.append("-----")
+        out.append("--" + action(cli, "Убрать из списка (файлы оставить)", "rm", t["id"]))
+        out.append("--" + action(cli, "Удалить вместе с файлами (в Корзину)", "rm", t["id"], "--files"))
         out.append(f"{fmt.bar(t['progress'])}  {int(t['progress'])}% · {t['state']}")
         if t["state"] == "качается":
             out.append(f"{fmt.size(t['done'])} из {fmt.size(t['size'])} · {fmt.speed(t['down_rate'])}")
@@ -78,15 +88,6 @@ def render(cli: str) -> str:
             out.append(f"{fmt.size(t['size'])} · отдаю {fmt.speed(t['up_rate'])} · рейтинг {t['ratio']}".replace(".", ","))
         if t["error"]:
             out.append(f"⚠︎ {_clean(t['error'])} | color=red")
-        target = str(Path(t["save_path"]) / t["name"])
-        if t["paused"]:
-            out.append("--" + action(cli, "Продолжить", "resume", t["id"]))
-        else:
-            out.append("--" + action(cli, "Пауза", "pause", t["id"]))
-        out.append("--" + action(cli, "Показать в Finder", "reveal", target, refresh=False))
-        out.append("-----")
-        out.append("--" + action(cli, "Убрать из списка (файлы оставить)", "rm", t["id"]))
-        out.append("--" + action(cli, "Удалить вместе с файлами (в Корзину)", "rm", t["id"], "--files"))
         out.append("---")
 
     out.append(action(cli, "Добавить magnet из буфера обмена", "add-clipboard"))

@@ -101,6 +101,8 @@ class Engine:
             "listen_interfaces": f"0.0.0.0:{port},[::]:{port}",
             "alert_mask": lt.alert_category.status | lt.alert_category.error | lt.alert_category.storage,
             "enable_dht": True,
+            "dht_bootstrap_nodes": "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
+                                   "router.utorrent.com:6881,dht.transmissionbt.com:6881",
             "enable_lsd": True,
             "enable_upnp": True,
             "enable_natpmp": True,

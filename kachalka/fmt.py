@@ -43,6 +43,13 @@ def finish_at(seconds: int | None) -> str:
     return t.strftime("%d.%m %H:%M") + " МСК"
 
 
+def when(iso: str | None) -> str:
+    """Время из истории (UTC ISO) по Москве."""
+    if not iso:
+        return "—"
+    return datetime.fromisoformat(iso).astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+
+
 def bar(percent: float, width: int = 20) -> str:
     n = int(percent * width / 100 + 0.5)
     return "▰" * n + "▱" * (width - n)

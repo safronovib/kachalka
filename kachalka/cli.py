@@ -98,7 +98,7 @@ def cmd_history(args) -> None:
     lines = []
     for r in rows:
         status = "удалено" if r["removed_at"] else ("скачано" if r["completed_at"] else "в работе")
-        lines.append(f"{r['added_at'][:16].replace('T', ' ')}  {status:9}  {fmt.size(r['total_size']):>9}  {r['name']}")
+        lines.append(f"{fmt.when(r['added_at'])}  {status:9}  {fmt.size(r['total_size']):>9}  {r['name']}")
     emit(args, {"history": rows}, "\n".join(lines) or "История пуста.")
 
 

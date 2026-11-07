@@ -22,12 +22,17 @@
 
 ## Установка
 
+Готовый пакет libtorrent для macOS есть на PyPI под Python 3.11–3.13. Проще всего взять Python 3.13 через [uv](https://docs.astral.sh/uv/):
+
 ```bash
-brew install libtorrent-rasterbar
 git clone https://github.com/safronovib/kachalka.git
 cd kachalka
-/usr/local/opt/python@3.15/bin/python3.15 -m kachalka.cli install   # на Apple Silicon: /opt/homebrew/opt/...
+V="$HOME/Library/Application Support/Kachalka/venv"
+uv venv --python 3.13 "$V" && uv pip install --python "$V/bin/python" libtorrent
+PYTHONPATH="$PWD" "$V/bin/python" -m kachalka.cli install
 ```
+
+`brew install libtorrent-rasterbar` тоже подойдёт, но на Intel-Маке Homebrew собирает его из исходников больше часа.
 
 `install` запоминает Python, в котором есть libtorrent, и включает автозапуск (LaunchAgent). Если стоит SwiftBar, он кладёт ссылку на плагин в папку плагинов. Ещё он ставит навык Claude в `~/.claude/skills/kachalka` и команду `~/.local/bin/kachalka`. Ненужное отключается флагами `--no-swiftbar` и `--no-skill`. Всё это убирает `kachalka uninstall`.
 
