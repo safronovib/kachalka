@@ -14,6 +14,7 @@ import warnings
 # Python-обёртка libtorrent 2.x помечает устаревшими files(), status() и др. — без этого журнал засоряется
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 import os
+import shutil
 import signal
 import socket
 import socketserver
@@ -33,6 +34,7 @@ from .config import (
     PID_PATH,
     RESUME_DIR,
     SOCKET,
+    TORRENTS_DIR,
     DB_PATH,
     load_config,
     save_config,
@@ -176,8 +178,10 @@ class Engine:
         save_path = os.path.expanduser(save_path or self.cfg["download_dir"])
         Path(save_path).mkdir(parents=True, exist_ok=True)
 
+        source_file = None
         if source.startswith("magnet:"):
             atp = lt.parse_magnet_uri(source)
+            new_ih = str(atp.info_hashes.get_best())
         else:
             if source.startswith(("http://", "https://")):
                 source_file = self._download_torrent_file(source)
@@ -187,6 +191,9 @@ class Engine:
                 raise ValueError(f"файл не найден: {source}")
             atp = lt.add_torrent_params()
             atp.ti = lt.torrent_info(source_file)
+            new_ih = str(atp.ti.info_hashes().get_best())
+        if any(hash_of(x) == new_ih for x in self.handles()):
+            raise ValueError("эта раздача уже в списке")
         atp.save_path = save_path
 
         with self.lock:
@@ -196,11 +203,99 @@ class Engine:
         size = st.total_wanted if st.has_metadata else 0
         self.store.added(ih, st.name or ih, source, save_path, size)
         self._save_resume(h, force=True)
+        # .torrent — в копилку; исходный файл из «Загрузок» уносим (в Корзину, если копия уже есть)
+        self._archive(h, source_file, from_url=source.startswith(("http://", "https://")))
         log.info("added %s %s", ih, st.name)
         sorted_to = self._auto_sort_early(h)
         if sorted_to:
             save_path = sorted_to
         return {"id": ih[:8], "hash": ih, "name": st.name or "(жду метаданные)", "save_path": save_path}
+
+    # --- копилка торрентов ---
+
+    @staticmethod
+    def _torrent_bytes(h) -> bytes:
+        """.torrent из идущей раздачи: info-словарь как есть (тот же info-hash) плюс трекеры."""
+        ti = h.torrent_file()
+        trackers = [[t["url"] if isinstance(t, dict) else t.url] for t in h.trackers()]
+        body = b"d"
+        if trackers:
+            body += b"13:announce-list" + lt.bencode(trackers)
+        return body + b"4:info" + bytes(ti.info_section()) + b"e"
+
+    def _archive(self, h, source_file: str | None = None, from_url: bool = False) -> None:
+        """Кладёт .torrent раздачи в копилку (TORRENTS_DIR/<hash>.torrent) и отмечает в истории.
+        source_file — исходный .torrent владельца: после копирования уносим его из «Загрузок»."""
+        if not h.status().has_metadata:
+            return  # magnet без метаданных — заархивируем, когда они придут
+        ih = hash_of(h)
+        dst = TORRENTS_DIR / f"{ih}.torrent"
+        try:
+            if not dst.exists():
+                TORRENTS_DIR.mkdir(parents=True, exist_ok=True)
+                if source_file and os.path.isfile(source_file):
+                    shutil.copy2(source_file, dst)
+                else:
+                    dst.write_bytes(self._torrent_bytes(h))
+            self.store.set_archive(ih, str(dst))
+        except Exception:
+            log.exception("archive %s", ih)
+            return
+        if source_file and os.path.isfile(source_file) and Path(source_file).parent != TORRENTS_DIR:
+            if from_url:
+                os.remove(source_file)  # временный файл, скачанный по ссылке
+            else:
+                move_to_trash(Path(source_file))
+
+    def stash(self, path: str) -> dict:
+        """Положить .torrent в копилку, не скачивая. Оригинал — в Корзину."""
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            raise ValueError(f"файл не найден: {path}")
+        ti = lt.torrent_info(path)
+        ih = str(ti.info_hashes().get_best())
+        dst = TORRENTS_DIR / f"{ih}.torrent"
+        TORRENTS_DIR.mkdir(parents=True, exist_ok=True)
+        if not dst.exists():
+            shutil.copy2(path, dst)
+        if not self.store.torrent(ih):
+            self.store.added(ih, ti.name(), str(dst), os.path.expanduser(self.cfg["download_dir"]), ti.total_size())
+        self.store.set_archive(ih, str(dst))
+        move_to_trash(Path(path))
+        return {"id": ih[:8], "name": ti.name(), "size": ti.total_size()}
+
+    def archive(self, search: str = "", limit: int = 200) -> dict:
+        in_session = {hash_of(h) for h in self.handles()}
+        rows = []
+        for r in self.store.archive_list(search, limit):
+            ih = r["info_hash"]
+            status = ("в списке" if ih in in_session else "удалено" if r.get("removed_at")
+                      else "скачано" if r.get("completed_at") else "в копилке")
+            rows.append({
+                "id": ih[:8], "hash": ih, "name": r["name"], "size": r["total_size"] or 0,
+                "added_at": r["added_at"], "completed_at": r["completed_at"], "removed_at": r["removed_at"],
+                "status": status, "in_session": ih in in_session,
+                "has_torrent": bool(r.get("archive") and os.path.isfile(r["archive"])),
+                "can_redownload": ih not in in_session and (
+                    bool(r.get("archive") and os.path.isfile(r["archive"]))
+                    or str(r.get("source") or "").startswith("magnet:")),
+            })
+        return {"archive": rows, "folder": str(TORRENTS_DIR)}
+
+    def redownload(self, ref: str, save_path: str | None = None) -> dict:
+        ref = ref.strip().lower()
+        rows = self.store.archive_list("", 10000)
+        hit = [r for r in rows if r["info_hash"].startswith(ref)] or \
+              [r for r in rows if ref and ref in (r["name"] or "").lower()]
+        if not hit:
+            raise ValueError(f"в архиве нет «{ref}»")
+        if len({r["info_hash"] for r in hit}) > 1:
+            raise ValueError("подходит несколько раздач: " + "; ".join(r["name"] for r in hit[:5]))
+        r = hit[0]
+        src = r["archive"] if r.get("archive") and os.path.isfile(r["archive"]) else r.get("source")
+        if not src or not (src.startswith("magnet:") or os.path.isfile(src)):
+            raise ValueError("для этой раздачи нет ни .torrent, ни magnet-ссылки")
+        return self.add(src, save_path)
 
     # --- этап 2: файлы, выбор серий, раскладка по папкам ---
 
@@ -489,6 +584,9 @@ class Engine:
             ih = hash_of(h)
             (RESUME_DIR / f"{ih}.fastresume").unlink(missing_ok=True)
             names.append(st.name)
+            # служебный файл кусков невыбранных файлов: libtorrent сам его не убирает
+            parts = Path(st.save_path) / f".{ih}.parts"
+            threading.Timer(5, lambda p=parts: p.unlink(missing_ok=True)).start()
             if trash_files and st.name:
                 # Сначала останавливаем раздачу и дожидаемся, пока libtorrent допишет буфер на диск
                 # (cache_flushed_alert). Иначе поздняя запись создаст файл заново после Корзины.
@@ -595,6 +693,7 @@ class Engine:
                     log.error("select after metadata: %s", e)
                     notify("Качалка: не нашёл серии", f"{st.name}: {e}")
             self._save_resume(h, force=True)
+            self._archive(h)  # magnet: метаданные пришли — .torrent в копилку
             self._auto_sort_early(h)
         elif isinstance(a, lt.torrent_finished_alert):
             h = a.handle
@@ -661,6 +760,10 @@ class Engine:
         log.info("trashed=%s %s", ok, [str(p) for p in paths])
 
     def periodic(self) -> None:
+        # раздачи, добавленные до появления копилки, тоже попадают в неё
+        for h in self.handles():
+            if h.status().has_metadata and not (TORRENTS_DIR / f"{hash_of(h)}.torrent").exists():
+                self._archive(h)
         # VPN переподключился (сменился utunN) или включился/выключился — перепривязываемся
         if net.resolve(self.cfg.get("bind_interface")) != self.active_interface:
             old = self.active_interface
@@ -767,6 +870,15 @@ class Engine:
                 self.viewer._cand_cache = None
                 return {"trashed": chosen}
             return {"candidates": cands}
+        if cmd == "stash":
+            return {"stashed": [self.stash(x) for x in req["paths"]]}
+        if cmd == "archive":
+            return self.archive(req.get("search") or "", int(req.get("limit") or 200))
+        if cmd == "redownload":
+            res = self.redownload(req["ref"], req.get("save_path"))
+            if req.get("episodes"):
+                res["select"] = self.select(res["hash"], {"mode": "only", "episodes": req["episodes"]})
+            return res
         if cmd == "files":
             return self.files(req["ref"])
         if cmd == "select":

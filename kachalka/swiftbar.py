@@ -121,7 +121,7 @@ def _render(cli: str) -> str:
         out.append("--" + action(cli, "Отменить раскладку", "undo", t["id"]))
         out.append("-----")
         out.append("--" + action(cli, "Убрать из списка (файлы оставить)", "rm", t["id"]))
-        out.append("--" + action(cli, "Удалить вместе с файлами (в Корзину)", "rm", t["id"], "--files"))
+        out.append("--" + action(cli, "Удалить вместе с файлами…", "confirm-rm", t["id"]))
         out.append(f"{fmt.bar(t['progress'])}  {int(t['progress'])}% · {t['state']}"
                    + (" · смотрю сериал" if t.get("follow") else ""))
         if t["state"] == "качается":
@@ -140,8 +140,8 @@ def _render(cli: str) -> str:
         out.append(f"Можно освободить {fmt.size(total)} ({len(cleanup)}) | size=12")
         for c in cleanup:
             out.append(f"--{_clean(c['name'])[:50]} — {_clean(c['reason'])}")
-            out.append("----" + action(cli, "Убрать в Корзину", "cleanup", "--apply", "--ids", c["id"]))
-        out.append("--" + action(cli, "Убрать всё это в Корзину", "cleanup", "--apply"))
+            out.append("----" + action(cli, "Убрать в Корзину…", "confirm-cleanup", "--ids", c["id"]))
+        out.append("--" + action(cli, "Убрать всё это в Корзину…", "confirm-cleanup"))
         out.append("---")
     if direct_mode:
         out.append(f"Сеть: напрямую ({iface}), мимо VPN | size=12")

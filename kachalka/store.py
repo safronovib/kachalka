@@ -82,6 +82,10 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        try:  # копилка .torrent-файлов: колонка появилась позже
+            self._db.execute("ALTER TABLE torrents ADD COLUMN archive TEXT")
+        except sqlite3.OperationalError:
+            pass
         self._db.commit()
 
     def _exec(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
@@ -99,10 +103,23 @@ class Store:
             """INSERT INTO torrents(info_hash, name, source, save_path, total_size, added_at)
                VALUES (?,?,?,?,?,?)
                ON CONFLICT(info_hash) DO UPDATE SET removed_at = NULL, files_trashed = 0,
-                   save_path = excluded.save_path""",
+                   completed_at = NULL, added_at = excluded.added_at, save_path = excluded.save_path""",
             (info_hash, name, source, save_path, total_size, now()),
         )
+        # скачиваем заново: прежние раскладки больше не про эти файлы — автораскладка сработает снова
+        self._exec("UPDATE moves SET status = 'old' WHERE info_hash = ? AND status = 'done'", (info_hash,))
         self.event(info_hash, "added", source)
+
+    # --- копилка торрентов ---
+
+    def set_archive(self, info_hash: str, path: str) -> None:
+        self._exec("UPDATE torrents SET archive = ? WHERE info_hash = ?", (path, info_hash))
+
+    def archive_list(self, search: str = "", limit: int = 200) -> list[dict]:
+        rows = self._exec("SELECT * FROM torrents ORDER BY added_at DESC")
+        q = search.strip().lower()
+        out = [dict(r) for r in rows if not q or q in (r["name"] or "").lower()]
+        return out[:limit]
 
     def update_meta(self, info_hash: str, name: str, total_size: int) -> None:
         self._exec("UPDATE torrents SET name = ?, total_size = ? WHERE info_hash = ?", (name, total_size, info_hash))

@@ -324,10 +324,25 @@ class Viewer:
 
     def _notify_cleanup(self) -> None:
         try:
-            c = [x for x in self.cleanup_candidates() if x["id"] not in self._notified_cleanup]
+            all_c = self.cleanup_candidates()
         except Exception:
             log.exception("cleanup candidates")
             return
+        # Правило владельца: скачано и cleanup_unopened_days ни разу не открыто — сносим сами
+        # (в Корзину). Выключается: kachalka set auto_delete_unopened false
+        if self.e.cfg.get("auto_delete_unopened"):
+            stale = [x for x in all_c if "ни разу не открыто" in x["reason"]]
+            for x in stale:
+                self.e.remove(x["id"], trash_files=True)
+                log.info("auto delete unopened: %s", x["name"])
+            if stale and self.e.cfg.get("notify", True):
+                from .daemon import notify
+                notify("Качалка: убрала непросмотренное",
+                       f"{len(stale)} шт., не открывались {self.e.cfg.get('cleanup_unopened_days')} дн.: "
+                       + ", ".join(x["name"] for x in stale)[:180])
+            all_c = [x for x in all_c if x not in stale]
+            self._cand_cache = None
+        c = [x for x in all_c if x["id"] not in self._notified_cleanup]
         if not c:
             return
         self._notified_cleanup |= {x["id"] for x in c}

@@ -250,6 +250,30 @@ def cmd_cleanup(args) -> None:
     emit(args, res, "\n".join(lines))
 
 
+def cmd_archive(args) -> None:
+    ensure_running()
+    res = call("archive", search=" ".join(args.search or []), limit=args.limit)
+    lines = [f"[{r['id']}] {fmt.when(r['added_at'])}  {r['status']:12} {fmt.size(r['size']):>9}  {r['name']}"
+             + ("" if r["can_redownload"] or r["in_session"] else "  (нет .torrent)") for r in res["archive"]]
+    lines.append(f"Копилка .torrent: {res['folder']}")
+    emit(args, res, "\n".join(lines))
+
+
+def cmd_stash(args) -> None:
+    ensure_running()
+    res = call("stash", paths=[os.path.abspath(os.path.expanduser(x)) for x in args.files])
+    emit(args, res, "\n".join(f"В копилке: {r['name']}  [{r['id']}]  {fmt.size(r['size'])}" for r in res["stashed"]))
+
+
+def cmd_redownload(args) -> None:
+    ensure_running()
+    res = call("redownload", ref=" ".join(args.ref), episodes=args.episodes)
+    text = f"Качаю заново: {res['name']}  [{res['id']}] → {res['save_path']}"
+    if res.get("select") and not res["select"].get("pending"):
+        text += "\n    только: " + ", ".join(res["select"]["selected"])
+    emit(args, res, text)
+
+
 def cmd_history(args) -> None:
     ensure_running()
     rows = call("history", limit=args.limit)["history"]
@@ -375,6 +399,37 @@ def cmd_reveal(args) -> None:
         subprocess.run(["open", str(p.parent)])
 
 
+def _confirm(question: str, button: str) -> bool:
+    """Системный диалог «точно?» — для удалений из меню значка, где легко промахнуться."""
+    script = ('on run argv\n'
+              'display dialog (item 1 of argv) buttons {"Отмена", (item 2 of argv)} '
+              'default button "Отмена" cancel button "Отмена" with title "Качалка" with icon caution\n'
+              'end run')
+    r = subprocess.run(["osascript", "-e", script, question, button], capture_output=True, text=True)
+    return r.returncode == 0 and button in r.stdout
+
+
+def cmd_confirm_rm(args) -> None:
+    ensure_running()
+    names = [t["name"] for t in call("list")["torrents"] if t["id"].startswith(args.ref)]
+    if not names:
+        return
+    if _confirm(f"Удалить «{names[0]}» вместе с файлами?\nФайлы уйдут в Корзину.", "В Корзину"):
+        call("remove", ref=args.ref, trash_files=True)
+
+
+def cmd_confirm_cleanup(args) -> None:
+    ensure_running()
+    cands = call("cleanup")["candidates"]
+    if args.ids:
+        cands = [c for c in cands if c["id"] in args.ids.split(",")]
+    if not cands:
+        return
+    listing = "\n".join(f"• {c['name']}" for c in cands[:8]) + ("\n…" if len(cands) > 8 else "")
+    if _confirm(f"Убрать в Корзину ({fmt.size(sum(c['size'] for c in cands))}):\n{listing}", "В Корзину"):
+        call("cleanup", apply=True, ids=[c["id"] for c in cands])
+
+
 def cmd_swiftbar_dismiss(args) -> None:
     from .swiftbar import dismiss
     dismiss()
@@ -496,6 +551,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--episodes", help="качать только эти серии: 4,5 / 4-6 / S02E04")
     sp.add_argument("--follow", action="store_true", help="режим «смотрю сериал»: качать по мере просмотра")
     sp.add_argument("--ahead", type=int, help="сколько серий держать наготове (с --follow)")
+    sp = add("archive", cmd_archive, "архив всех раздач (копилка .torrent), можно с поиском")
+    sp.add_argument("search", nargs="*")
+    sp.add_argument("--limit", type=int, default=200)
+    sp = add("stash", cmd_stash, "положить .torrent в копилку, не скачивая (оригинал — в Корзину)")
+    sp.add_argument("files", nargs="+")
+    sp = add("redownload", cmd_redownload, "скачать заново из архива: id или часть названия")
+    sp.add_argument("ref", nargs="+")
+    sp.add_argument("--episodes")
     sp = add("watching", cmd_watching, "что посмотрено, что смотрю, на какой серии остановился")
     sp.add_argument("ref", nargs="?")
     sp = add("watched", cmd_watched, "отметить посмотренным (или --unwatched)")
@@ -565,6 +628,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--downloads", action="store_true")
     add("swiftbar", cmd_swiftbar, "вывод для плагина SwiftBar")
     add("swiftbar-dismiss", cmd_swiftbar_dismiss, "убрать «✓ скачано» из строки меню")
+    sp = add("confirm-rm", cmd_confirm_rm, "удалить с файлами после подтверждения в диалоге (для меню)")
+    sp.add_argument("ref")
+    sp = add("confirm-cleanup", cmd_confirm_cleanup, "чистка после подтверждения в диалоге (для меню)")
+    sp.add_argument("--ids")
     sp = add("install", cmd_install, "автозапуск, значок SwiftBar, навык Claude, команда в PATH")
     sp.add_argument("--no-swiftbar", action="store_true")
     sp.add_argument("--no-skill", action="store_true")
