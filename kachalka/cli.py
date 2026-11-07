@@ -427,7 +427,27 @@ def cmd_install(args) -> None:
         SKILL_DST.symlink_to(SKILL_SRC)
         done.append(f"Навык Claude: {SKILL_DST}")
 
-    # 4. Команда kachalka в PATH
+    # 3б. Значок не должен прятаться за Hidden Bar/Bartender: закрепляем его справа,
+    #     рядом с системными значками (позиция считается от правого края экрана)
+    if SWIFTBAR_DIR.is_dir() and not args.no_swiftbar:
+        for key in (f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN.name}",
+                    f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN}"):
+            subprocess.run(["defaults", "write", "com.ameba.SwiftBar", key, "-float", "420"], capture_output=True)
+
+    # 4. Окно (этап 4): build/Kachalka.app → ~/Applications
+    app_src = ROOT / "build" / "Kachalka.app"
+    if not app_src.exists() and (ROOT / "app" / "build.sh").exists() and not args.no_app:
+        subprocess.run([str(ROOT / "app" / "build.sh")], capture_output=True)
+    if app_src.exists() and not args.no_app:
+        dst = Path.home() / "Applications" / "Kachalka.app"
+        dst.parent.mkdir(exist_ok=True)
+        subprocess.run(["rm", "-rf", str(dst)])
+        subprocess.run(["ditto", str(app_src), str(dst)])
+        subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/"
+                        "Support/lsregister", "-f", str(dst)], capture_output=True)
+        done.append(f"Окно: {dst}")
+
+    # 5. Команда kachalka в PATH
     local_bin = Path.home() / ".local/bin"
     local_bin.mkdir(parents=True, exist_ok=True)
     link = local_bin / "kachalka"
@@ -443,7 +463,10 @@ def cmd_uninstall(args) -> None:
     for p in (AGENT_PLIST, SWIFTBAR_PLUGIN, SKILL_DST, Path.home() / ".local/bin/kachalka"):
         if p.is_symlink() or p.exists():
             p.unlink()
-    print(f"Автозапуск, значок, навык и команда убраны. Раздачи и история остались в {APP_DIR}")
+    app = Path.home() / "Applications" / "Kachalka.app"
+    if app.exists():
+        subprocess.run(["rm", "-rf", str(app)])
+    print(f"Автозапуск, значок, окно, навык и команда убраны. Раздачи и история остались в {APP_DIR}")
 
 
 # ---------- разбор аргументов ----------
@@ -536,6 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("install", cmd_install, "автозапуск, значок SwiftBar, навык Claude, команда в PATH")
     sp.add_argument("--no-swiftbar", action="store_true")
     sp.add_argument("--no-skill", action="store_true")
+    sp.add_argument("--no-app", action="store_true", help="не ставить окно Kachalka.app")
     add("uninstall", cmd_uninstall, "убрать автозапуск, значок, навык и команду")
     return p
 

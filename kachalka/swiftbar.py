@@ -13,7 +13,7 @@ from . import fmt, net
 from .client import NotRunning, call
 
 DONE_VISIBLE_SECONDS = 600
-ACTIVE = {"качается", "ищу метаданные", "проверка", "выделяю место"}
+ACTIVE = {"качается", "ищу метаданные", "проверка", "выделяю место", "в очереди"}
 
 
 def _q(s: str) -> str:
@@ -113,6 +113,7 @@ def render(cli: str) -> str:
                    else "Сеть: VPN не найден, как решит система | size=12")
         out.append(action(cli, "Пустить мимо VPN", "vpn", "off"))
     out.append("---")
+    out.append(action("/usr/bin/open", "Открыть окно Качалки", "-b", "com.kachalka.app", refresh=False))
     out.append(action(cli, "Добавить magnet из буфера обмена", "add-clipboard"))
     out.append(action(cli, "Пауза всех", "pause", "all"))
     out.append(action(cli, "Продолжить все", "resume", "all"))

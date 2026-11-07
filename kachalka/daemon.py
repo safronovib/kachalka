@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import warnings
+
+# Python-обёртка libtorrent 2.x помечает устаревшими files(), status() и др. — без этого журнал засоряется
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 import os
 import signal
 import socket
@@ -413,13 +417,15 @@ class Engine:
         left = max(size - done, 0)
         eta = int(left / st.download_rate) if st.download_rate > 0 and left else None
         state = str(st.state).split(".")[-1]
-        paused = is_paused(st)
+        # пауза владельца = paused без auto_managed; paused + auto_managed = ждёт своей очереди
+        queued = is_paused(st) and bool(st.flags & lt.torrent_flags.auto_managed)
+        paused = is_paused(st) and not queued
         downloaded = st.all_time_download or st.total_wanted_done
         return {
             "id": ih[:8],
             "hash": ih,
             "name": st.name or ih,
-            "state": "пауза" if paused else STATE_NAMES.get(state, state),
+            "state": "пауза" if paused else "в очереди" if queued else STATE_NAMES.get(state, state),
             "paused": paused,
             "progress": round(done * 100 / size, 1) if size else round(st.progress * 100, 1),
             "size": size,
