@@ -35,7 +35,27 @@ def action(cli: str, title: str, *params: str, refresh: bool = True) -> str:
     return " ".join(parts)
 
 
+# Когда ничего не качается, значок не убираем совсем: SwiftBar при повторном показе ставит
+# значок в самый левый край, и Hidden Bar/Bartender его прячут. Вместо этого показываем
+# невидимый символ нулевой ширины — место в строке меню сохраняется, глазу ничего не видно.
+IDLE = "​"
+
+
+def _idle(cli: str) -> str:
+    return "\n".join([
+        f"{IDLE} | size=1",
+        "---",
+        action("/usr/bin/open", "Открыть окно Качалки", "-b", "com.kachalka.app", refresh=False),
+        action(cli, "Добавить magnet из буфера обмена", "add-clipboard"),
+    ]) + "\n"
+
+
 def render(cli: str) -> str:
+    out = _render(cli)
+    return out or _idle(cli)
+
+
+def _render(cli: str) -> str:
     try:
         torrents = call("list", timeout=3)["torrents"]
         history = call("history", timeout=3, limit=20)["history"]

@@ -429,9 +429,12 @@ def cmd_install(args) -> None:
 
     # 3б. Значок не должен прятаться за Hidden Bar/Bartender: закрепляем его справа,
     #     рядом с системными значками (позиция считается от правого края экрана)
+    #     SwiftBar хранит позицию под настоящим путём плагина (ссылка раскрывается), а macOS
+    #     стирает её, если значок скрыть, поэтому плагин в простое показывает невидимый символ.
     if SWIFTBAR_DIR.is_dir() and not args.no_swiftbar:
         for key in (f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN.name}",
-                    f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN}"):
+                    f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN}",
+                    f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN.resolve()}"):
             subprocess.run(["defaults", "write", "com.ameba.SwiftBar", key, "-float", "420"], capture_output=True)
 
     # 4. Окно (этап 4): build/Kachalka.app → ~/Applications
