@@ -95,10 +95,16 @@ class Engine:
         self.manual_resume: set[str] = set()        # раздачи, которые владелец сам возобновил после лимита
         self.outstanding_resume = 0
         self.started_at = time.time()
+        self.counters: dict[str, int] = {}          # последние счётчики libtorrent (session_stats)
+        self._metric_index = {m.name: m.value_index for m in lt.session_stats_metrics()}
+        self.net_errors: list[str] = []             # последние сетевые ошибки для diag
 
         port = int(self.cfg["listen_port"])
+        iface = (self.cfg.get("bind_interface") or "").strip()
+        net = ({"listen_interfaces": f"{iface}:{port}", "outgoing_interfaces": iface} if iface
+               else {"listen_interfaces": f"0.0.0.0:{port},[::]:{port}"})
         self.ses = lt.session({
-            "listen_interfaces": f"0.0.0.0:{port},[::]:{port}",
+            **net,
             "alert_mask": lt.alert_category.status | lt.alert_category.error | lt.alert_category.storage,
             "enable_dht": True,
             "dht_bootstrap_nodes": "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
@@ -264,8 +270,34 @@ class Engine:
         })
         return {"download_limit_kbps": self.cfg["download_limit_kbps"], "upload_limit_kbps": self.cfg["upload_limit_kbps"]}
 
+    def diag(self) -> dict:
+        """Сетевая диагностика: DHT, трекеры, пиры, последние ошибки."""
+        torrents = []
+        for h in self.handles():
+            st = h.status()
+            trackers = []
+            for t in h.trackers():
+                ends = t.get("endpoints") or []
+                msgs = [e.get("message", "") for e in ends if e.get("message")]
+                fails = max([e.get("fails", 0) for e in ends] or [0])
+                trackers.append({"url": t["url"], "fails": fails, "message": "; ".join(msgs)[:200]})
+            torrents.append({
+                "id": hash_of(h)[:8], "name": st.name, "has_metadata": st.has_metadata,
+                "peers": st.num_peers, "seeds": st.num_seeds, "connect_candidates": st.connect_candidates,
+                "trackers": trackers,
+            })
+        return {
+            "counters": self.counters,
+            "listen_port": self.ses.listen_port(),
+            "is_listening": self.ses.is_listening(),
+            "bootstrap": self.ses.get_settings().get("dht_bootstrap_nodes"),
+            "net_errors": self.net_errors,
+            "torrents": torrents,
+        }
+
     def info(self) -> dict:
         s = self.ses.status()
+        dht = self.counters.get("dht.dht_nodes", s.dht_nodes)
         return {
             "version": __version__,
             "libtorrent": lt.__version__,
@@ -273,7 +305,7 @@ class Engine:
             "uptime_seconds": int(time.time() - self.started_at),
             "download_dir": self.cfg["download_dir"],
             "listen_port": self.ses.listen_port(),
-            "dht_nodes": s.dht_nodes,
+            "dht_nodes": dht,
             "down_rate": s.payload_download_rate,
             "up_rate": s.payload_upload_rate,
             "torrents": len(self.handles()),
@@ -318,6 +350,15 @@ class Engine:
                 self.store.event(hash_of(a.handle), "error", a.message())
             except Exception:
                 pass
+        elif isinstance(a, lt.session_stats_alert):
+            values = a.values  # в Python-обёртке это уже словарь «имя → значение»
+            if not isinstance(values, dict):
+                values = {name: values[i] for name, i in self._metric_index.items()}
+            self.counters = {k: v for k, v in values.items()
+                             if k.startswith(("dht.", "net.", "peer.", "ses.num_")) and v}
+        elif isinstance(a, (lt.tracker_error_alert, lt.listen_failed_alert,
+                            getattr(lt, "udp_error_alert", lt.listen_failed_alert))):
+            self.net_errors = (self.net_errors + [f"{time.strftime('%H:%M:%S')} {a.message()}"])[-20:]
         elif isinstance(a, lt.add_torrent_alert) and a.error.value():
             log.error("restore failed: %s", a.message())
 
@@ -350,6 +391,9 @@ class Engine:
                     self.handle_alert(a)
                 except Exception:
                     log.exception("alert %s", type(a).__name__)
+            if time.time() - getattr(self, "_last_stats", 0) > 5:
+                self._last_stats = time.time()
+                self.ses.post_session_stats()
             if time.time() - last > PERIODIC_SECONDS:
                 last = time.time()
                 try:
@@ -375,6 +419,8 @@ class Engine:
         cmd = req.get("cmd")
         if cmd == "ping":
             return {"pong": True}
+        if cmd == "diag":
+            return self.diag()
         if cmd == "info":
             return self.info()
         if cmd == "add":

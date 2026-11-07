@@ -12,6 +12,9 @@ from pathlib import Path
 
 from .config import APP_DIR, LOG_PATH, SOCKET, ensure_dirs
 
+AGENT_LABEL = "com.kachalka.daemon"
+AGENT_PLIST = Path.home() / "Library/LaunchAgents" / f"{AGENT_LABEL}.plist"
+
 
 class NotRunning(Exception):
     pass
@@ -55,14 +58,20 @@ def start_background(wait: float = 10) -> bool:
     if is_running():
         return True
     ensure_dirs()
-    root = Path(__file__).resolve().parent.parent
-    env = dict(os.environ, PYTHONPATH=str(root))
-    with open(LOG_PATH, "ab") as logf:
-        subprocess.Popen(
-            [sys.executable, "-m", "kachalka.daemon"],
-            cwd=str(APP_DIR), env=env, stdin=subprocess.DEVNULL,
-            stdout=logf, stderr=logf, start_new_session=True,
-        )
+    if AGENT_PLIST.exists():
+        # Установлен автозапуск: поднимаем через launchd, чтобы программа не стала
+        # дочерним процессом того, кто вызвал команду (терминала, песочницы, SwiftBar).
+        subprocess.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{AGENT_LABEL}"],
+                       capture_output=True)
+    else:
+        root = Path(__file__).resolve().parent.parent
+        env = dict(os.environ, PYTHONPATH=str(root))
+        with open(LOG_PATH, "ab") as logf:
+            subprocess.Popen(
+                [sys.executable, "-m", "kachalka.daemon"],
+                cwd=str(APP_DIR), env=env, stdin=subprocess.DEVNULL,
+                stdout=logf, stderr=logf, start_new_session=True,
+            )
     deadline = time.time() + wait
     while time.time() < deadline:
         if is_running():

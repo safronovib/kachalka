@@ -11,13 +11,11 @@ import sys
 from pathlib import Path
 
 from . import __version__, fmt
-from .client import NotRunning, call, is_running, start_background
+from .client import AGENT_LABEL, AGENT_PLIST, NotRunning, call, is_running, start_background
 from .config import APP_DIR, LOG_PATH, load_config
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "bin" / "kachalka"
-AGENT_LABEL = "com.kachalka.daemon"
-AGENT_PLIST = Path.home() / "Library/LaunchAgents" / f"{AGENT_LABEL}.plist"
 SWIFTBAR_DIR = Path.home() / "Library/Application Support/SwiftBarPlugins"
 SWIFTBAR_PLUGIN = SWIFTBAR_DIR / "kachalka.5s.sh"
 SKILL_SRC = ROOT / "skill"
@@ -128,6 +126,23 @@ def cmd_info(args) -> None:
          f"Качалка {i['version']} (libtorrent {i['libtorrent']}), pid {i['pid']}\n"
          f"Папка: {i['download_dir']}\nПорт: {i['listen_port']}, DHT-узлов: {i['dht_nodes']}\n"
          f"Раздач: {i['torrents']}, ↓{fmt.speed(i['down_rate'])} ↑{fmt.speed(i['up_rate'])}")
+
+
+def cmd_diag(args) -> None:
+    ensure_running()
+    print(json.dumps(call("diag"), ensure_ascii=False, indent=2))
+
+
+def cmd_restart(args) -> None:
+    if AGENT_PLIST.exists():
+        r = subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{AGENT_LABEL}"],
+                           capture_output=True, text=True)
+        print("Перезапущена." if r.returncode == 0 else f"Ошибка: {r.stderr.strip()}")
+    else:
+        cmd_stop(args)
+        import time
+        time.sleep(3)
+        cmd_start(args)
 
 
 def cmd_start(args) -> None:
@@ -270,6 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
     add("info", cmd_info, "состояние фоновой программы", aliases=("status",))
     add("start", cmd_start, "запустить фоновую программу")
     add("stop", cmd_stop, "остановить фоновую программу")
+    add("restart", cmd_restart, "перезапустить фоновую программу (например, после обновления кода)")
+    add("diag", cmd_diag, "сетевая диагностика: DHT, трекеры, ошибки")
     add("daemon", cmd_daemon, "запустить фоновую программу в этом окне (для отладки)")
     sp = add("reveal", cmd_reveal, "показать файл в Finder (без аргумента — папку загрузок)")
     sp.add_argument("target", nargs="?")
