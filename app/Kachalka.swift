@@ -180,6 +180,21 @@ struct Candidate: Decodable, Identifiable {
 
 struct CleanupResp: Decodable { let candidates: [Candidate]? }
 
+struct ArchiveItem: Decodable, Identifiable, Equatable {
+    let id: String
+    let hash: String
+    let name: String
+    let size: Int64
+    let added_at: String?
+    let completed_at: String?
+    let removed_at: String?
+    let status: String
+    let in_session: Bool
+    let can_redownload: Bool
+}
+
+struct ArchiveResp: Decodable { let archive: [ArchiveItem] }
+
 // MARK: - Форматирование (как в CLI)
 
 enum Fmt {
@@ -207,6 +222,16 @@ enum Fmt {
         f.dateFormat = s < 20 * 3600 ? "HH:mm" : "d.MM HH:mm"
         return "к " + f.string(from: Date().addingTimeInterval(TimeInterval(s))) + " МСК"
     }
+    /// ISO-время из истории → «08.11.2026 00:39» по Москве
+    static func when(_ iso: String?) -> String {
+        guard let iso else { return "—" }
+        let p = ISO8601DateFormatter()
+        guard let d = p.date(from: iso) else { return iso }
+        let f = DateFormatter()
+        f.timeZone = TimeZone(identifier: "Europe/Moscow")
+        f.dateFormat = "dd.MM.yyyy HH:mm"
+        return f.string(from: d)
+    }
     static func episode(_ f: FileItem) -> String? {
         guard let e = f.episode else { return nil }
         if let s = f.season { return String(format: "S%02dE%02d", s, e) }
@@ -226,6 +251,8 @@ final class Model: ObservableObject {
     @Published var connected = true
     @Published var errorText: String?
     @Published var busy = false
+    @Published var archive: [ArchiveItem] = []
+    var archiveVisible = false
 
     private var timer: Timer?
     private var ticks = 0
@@ -242,10 +269,14 @@ final class Model: ObservableObject {
 
     func refresh(full: Bool) {
         let sel = selection
+        let wantArchive = archiveVisible && full
         queue.async { [weak self] in
             guard let self else { return }
             do {
                 let list = try Daemon.decode(ListResp.self, ["cmd": "list"])
+                if wantArchive, let a = try? Daemon.decode(ArchiveResp.self, ["cmd": "archive", "limit": 1000]) {
+                    DispatchQueue.main.async { if self.archive != a.archive { self.archive = a.archive } }
+                }
                 var info: Info? = nil
                 var cands: [Candidate]? = nil
                 if full {
@@ -321,8 +352,47 @@ final class Model: ObservableObject {
 // MARK: - Список
 
 enum Filter: String, CaseIterable, Identifiable {
-    case all = "Все", downloading = "Качаются", seeding = "Готово", follow = "Смотрю"
+    case all = "Все", downloading = "Качаются", seeding = "Готово", follow = "Смотрю", archive = "Архив"
     var id: String { rawValue }
+}
+
+struct ArchiveRow: View {
+    @ObservedObject var m: Model
+    let a: ArchiveItem
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: icon).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(a.name).font(.headline).lineLimit(1).truncationMode(.middle)
+                Text(caption).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            if a.in_session {
+                Text("в списке").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Button("Скачать заново") { m.run(["cmd": "redownload", "ref": a.hash]) }
+                    .disabled(!a.can_redownload)
+                    .help(a.can_redownload ? "Добавить снова и скачать" : "Нет ни .torrent, ни magnet-ссылки")
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    var icon: String {
+        switch a.status {
+        case "в списке": return "arrow.down.circle"
+        case "удалено": return "trash"
+        case "скачано": return "checkmark.circle"
+        default: return "tray.full"
+        }
+    }
+
+    var caption: String {
+        var parts = [a.status, Fmt.size(a.size), "добавлено " + Fmt.when(a.added_at)]
+        if a.removed_at != nil { parts.append("удалено " + Fmt.when(a.removed_at)) }
+        return parts.joined(separator: " · ")
+    }
 }
 
 struct TorrentRow: View {
@@ -595,22 +665,38 @@ struct ContentView: View {
             case .downloading: f = t.isDownloading
             case .seeding: f = !t.isDownloading
             case .follow: f = t.follow == true
+            case .archive: f = false
             }
             return f && (search.isEmpty || t.name.localizedCaseInsensitiveContains(search))
         }
     }
 
+    var archiveShown: [ArchiveItem] {
+        search.isEmpty ? m.archive : m.archive.filter { $0.name.localizedCaseInsensitiveContains(search) }
+    }
+
     var body: some View {
         NavigationSplitView {
-            List(shown, selection: $m.selection) { t in
-                TorrentRow(t: t).tag(t.id)
-                    .contextMenu {
-                        Button(t.paused ? "Продолжить" : "Пауза") { m.run(["cmd": t.paused ? "resume" : "pause", "ref": t.id]) }
-                        Button("Разложить по папкам") { m.run(["cmd": "sort", "ref": t.id]) }
-                        Button("Убрать из списка") { m.run(["cmd": "remove", "ref": t.id]) }
+            Group {
+                if filter == .archive {
+                    List(archiveShown) { a in ArchiveRow(m: m, a: a) }
+                        .overlay {
+                            if archiveShown.isEmpty {
+                                Text(search.isEmpty ? "Архив пуст" : "Ничего не нашлось").foregroundStyle(.secondary)
+                            }
+                        }
+                } else {
+                    List(shown, selection: $m.selection) { t in
+                        TorrentRow(t: t).tag(t.id)
+                            .contextMenu {
+                                Button(t.paused ? "Продолжить" : "Пауза") { m.run(["cmd": t.paused ? "resume" : "pause", "ref": t.id]) }
+                                Button("Разложить по папкам") { m.run(["cmd": "sort", "ref": t.id]) }
+                                Button("Убрать из списка") { m.run(["cmd": "remove", "ref": t.id]) }
+                            }
                     }
+                }
             }
-            .navigationSplitViewColumnWidth(min: 340, ideal: 420)
+            .navigationSplitViewColumnWidth(min: 360, ideal: 460)
             .safeAreaInset(edge: .top) {
                 Picker("Показать", selection: $filter) {
                     ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
@@ -621,7 +707,7 @@ struct ContentView: View {
                 .padding(.vertical, 6)
             }
             .overlay {
-                if m.torrents.isEmpty {
+                if m.torrents.isEmpty && filter != .archive {
                     VStack(spacing: 8) {
                         Image(systemName: "arrow.down.circle").font(.system(size: 44)).foregroundStyle(.secondary)
                         Text(m.connected ? "Загрузок нет" : "Запускаю фоновую программу…").font(.headline)
@@ -632,11 +718,22 @@ struct ContentView: View {
                 }
             }
         } detail: {
-            if let sel = m.selection, let t = shown.first(where: { $0.id == sel }) {
+            if filter == .archive {
+                VStack(spacing: 8) {
+                    Image(systemName: "tray.full").font(.system(size: 40)).foregroundStyle(.secondary)
+                    Text("Архив: всё, что ты когда-либо качал").font(.headline)
+                    Text("Удалил ради места — нажми «Скачать заново». .torrent-файлы хранятся в копилке программы.")
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 360)
+                }
+            } else if let sel = m.selection, let t = shown.first(where: { $0.id == sel }) {
                 DetailView(m: m, t: t)
             } else {
                 Text("Выбери загрузку слева").foregroundStyle(.secondary)
             }
+        }
+        .onChange(of: filter) {
+            m.archiveVisible = filter == .archive
+            if filter == .archive { m.refresh(full: true) }
         }
         .searchable(text: $search, placement: .sidebar, prompt: "Поиск")
         .onChange(of: m.selection) {

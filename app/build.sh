@@ -14,6 +14,9 @@ for arch in x86_64 arm64; do
 done
 lipo -create "$TMP/Kachalka-x86_64" "$TMP/Kachalka-arm64" -output "$APP/Contents/MacOS/Kachalka"
 cp app/Info.plist "$APP/Contents/Info.plist"
+# русская локализация: macOS переводит стандартные меню (Файл, Правка, Окно…)
+mkdir -p "$APP/Contents/Resources/ru.lproj"
+printf '"CFBundleName" = "Качалка";\n"CFBundleDisplayName" = "Качалка";\n' > "$APP/Contents/Resources/ru.lproj/InfoPlist.strings"
 
 # значок
 swift app/make_icon.swift "$TMP/icon.png"
