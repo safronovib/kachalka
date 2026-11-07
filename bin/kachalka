@@ -1,0 +1,10 @@
+#!/bin/bash
+# Точка входа. Python берётся тот, что запомнил `kachalka install` (в нём есть libtorrent).
+SELF="$(readlink -f "$0")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+CACHE="${KACHALKA_HOME:-$HOME/Library/Application Support/Kachalka}/python"
+PY="${KACHALKA_PYTHON:-}"
+[ -z "$PY" ] && [ -f "$CACHE" ] && PY="$(head -1 "$CACHE")"
+[ -z "$PY" ] || [ ! -x "$PY" ] && PY="$(command -v python3)"
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m kachalka.cli "$@"
