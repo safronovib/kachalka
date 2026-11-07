@@ -23,7 +23,7 @@ from pathlib import Path
 
 import libtorrent as lt
 
-from . import __version__
+from . import __version__, net
 from .config import (
     LOG_PATH,
     PID_PATH,
@@ -92,6 +92,7 @@ class Engine:
         self.lock = threading.RLock()
         self.stopping = threading.Event()
         self.pending_trash: dict[str, Path] = {}   # hash -> путь, который надо унести в корзину после удаления
+        self.pending_flush: dict[str, tuple] = {}  # hash -> (handle, когда начали), ждём сброса буфера
         self.manual_resume: set[str] = set()        # раздачи, которые владелец сам возобновил после лимита
         self.outstanding_resume = 0
         self.started_at = time.time()
@@ -117,7 +118,8 @@ class Engine:
     def _net_settings(self) -> dict:
         """Через какой интерфейс идёт торрент-трафик. Пусто = как вся система (обычно через VPN)."""
         port = int(self.cfg["listen_port"])
-        iface = (self.cfg.get("bind_interface") or "").strip()
+        iface = net.resolve(self.cfg.get("bind_interface"))
+        self.active_interface = iface
         if iface:
             return {"listen_interfaces": f"{iface}:{port}", "outgoing_interfaces": iface}
         return {"listen_interfaces": f"0.0.0.0:{port},[::]:{port}", "outgoing_interfaces": ""}
@@ -253,14 +255,25 @@ class Engine:
         for h in self.find(ref):
             st = h.status()
             ih = hash_of(h)
-            if trash_files and st.name:
-                self.pending_trash[ih] = Path(st.save_path) / st.name
-            elif not trash_files:
-                self.store.removed(ih, trashed=False)
-            self.ses.remove_torrent(h)
             (RESUME_DIR / f"{ih}.fastresume").unlink(missing_ok=True)
             names.append(st.name)
+            if trash_files and st.name:
+                # Сначала останавливаем раздачу и дожидаемся, пока libtorrent допишет буфер на диск
+                # (cache_flushed_alert). Иначе поздняя запись создаст файл заново после Корзины.
+                self.pending_trash[ih] = Path(st.save_path) / st.name
+                self.pending_flush[ih] = (h, time.time())
+                h.unset_flags(lt.torrent_flags.auto_managed)
+                h.pause()
+                h.flush_cache()
+            else:
+                self.store.removed(ih, trashed=False)
+                self.ses.remove_torrent(h)
         return names
+
+    def _finish_removal(self, ih: str) -> None:
+        entry = self.pending_flush.pop(ih, None)
+        if entry and entry[0].is_valid():
+            self.ses.remove_torrent(entry[0])
 
     def set_limits(self, down_kbps: int | None, up_kbps: int | None) -> dict:
         if down_kbps is not None:
@@ -310,6 +323,7 @@ class Engine:
             "download_dir": self.cfg["download_dir"],
             "listen_port": self.ses.listen_port(),
             "bind_interface": self.cfg.get("bind_interface") or "",
+            "active_interface": self.active_interface,
             "dht_nodes": dht,
             "down_rate": s.payload_download_rate,
             "up_rate": s.payload_upload_rate,
@@ -343,6 +357,10 @@ class Engine:
                 log.info("finished %s %s", ih, st.name)
                 if self.cfg.get("notify", True):
                     notify("Качалка: скачано", st.name)
+        elif isinstance(a, lt.cache_flushed_alert):
+            ih = hash_of(a.handle)
+            if ih in self.pending_flush:
+                self._finish_removal(ih)
         elif isinstance(a, lt.torrent_removed_alert):
             ih = str(a.info_hashes.get_best()) if hasattr(a, "info_hashes") else str(a.info_hash)
             path = self.pending_trash.pop(ih, None)
@@ -369,9 +387,20 @@ class Engine:
 
     def _trash_later(self, ih: str, path: Path) -> None:
         ok = move_to_trash(path)
+        # Контроль: если запоздалая запись всё же создала файл заново, это мусор — тоже в Корзину
+        time.sleep(3)
+        if ok and path.exists():
+            log.warning("file reappeared after trash, trashing again: %s", path)
+            move_to_trash(path)
         self.store.removed(ih, trashed=ok)
+        log.info("trashed=%s %s", ok, path)
 
     def periodic(self) -> None:
+        # VPN переподключился (сменился utunN) или включился/выключился — перепривязываемся
+        if net.resolve(self.cfg.get("bind_interface")) != self.active_interface:
+            old = self.active_interface
+            self.ses.apply_settings(self._net_settings())
+            log.info("interface %s -> %s", old or "system", self.active_interface or "system")
         limit = self.cfg.get("stop_seeding_at_ratio")
         for h in self.handles():
             self._save_resume(h)
@@ -396,6 +425,10 @@ class Engine:
                     self.handle_alert(a)
                 except Exception:
                     log.exception("alert %s", type(a).__name__)
+            # Если сброс буфера не подтвердился за 10 с, удаляем раздачу всё равно
+            for ih, (_, since) in list(self.pending_flush.items()):
+                if time.time() - since > 10:
+                    self._finish_removal(ih)
             if time.time() - getattr(self, "_last_stats", 0) > 5:
                 self._last_stats = time.time()
                 self.ses.post_session_stats()
@@ -472,7 +505,10 @@ class _Handler(socketserver.StreamRequestHandler):
         except Exception as e:
             log.exception("command failed")
             resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        self.wfile.write(json.dumps(resp, ensure_ascii=False).encode() + b"\n")
+        try:
+            self.wfile.write(json.dumps(resp, ensure_ascii=False).encode() + b"\n")
+        except BrokenPipeError:
+            pass  # клиент (например, SwiftBar по таймауту) уже ушёл
 
 
 class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):

@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import fmt
+from . import fmt, net
 from .client import NotRunning, call
 
 DONE_VISIBLE_SECONDS = 600
@@ -39,7 +39,9 @@ def render(cli: str) -> str:
     try:
         torrents = call("list", timeout=3)["torrents"]
         history = call("history", timeout=3, limit=20)["history"]
-        iface = call("info", timeout=3).get("bind_interface", "")
+        info = call("info", timeout=3)
+        iface = info.get("active_interface", "")
+        direct_mode = info.get("bind_interface") == net.DIRECT
     except (NotRunning, OSError, RuntimeError, ValueError):
         return ""
 
@@ -91,11 +93,12 @@ def render(cli: str) -> str:
             out.append(f"⚠︎ {_clean(t['error'])} | color=red")
         out.append("---")
 
-    if iface:
+    if direct_mode:
         out.append(f"Сеть: напрямую ({iface}), мимо VPN | size=12")
         out.append(action(cli, "Пустить через VPN", "vpn", "on"))
     else:
-        out.append("Сеть: через VPN | size=12")
+        out.append(f"Сеть: через VPN ({iface}) | size=12" if net.is_tunnel(iface)
+                   else "Сеть: VPN не найден, как решит система | size=12")
         out.append(action(cli, "Пустить мимо VPN", "vpn", "off"))
     out.append("---")
     out.append(action(cli, "Добавить magnet из буфера обмена", "add-clipboard"))

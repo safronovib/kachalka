@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, fmt
+from . import __version__, fmt, net
 from .client import AGENT_LABEL, AGENT_PLIST, NotRunning, call, is_running, start_background
 from .config import APP_DIR, LOG_PATH, load_config
 
@@ -128,26 +128,6 @@ def cmd_info(args) -> None:
          f"Раздач: {i['torrents']}, ↓{fmt.speed(i['down_rate'])} ↑{fmt.speed(i['up_rate'])}")
 
 
-TUNNEL_PREFIXES = ("utun", "ipsec", "ppp", "tun", "tap", "wg")
-
-
-def physical_interface() -> str:
-    """Основной физический интерфейс (Wi-Fi или Ethernet), даже когда VPN включён."""
-    out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if line.strip().startswith("interface:"):
-            iface = line.split(":", 1)[1].strip()
-            if not iface.startswith(TUNNEL_PREFIXES):
-                return iface
-    ports = subprocess.run(["networksetup", "-listallhardwareports"], capture_output=True, text=True).stdout
-    devices = [l.split(":", 1)[1].strip() for l in ports.splitlines() if l.startswith("Device:")]
-    for dev in devices:
-        info = subprocess.run(["ipconfig", "getifaddr", dev], capture_output=True, text=True).stdout.strip()
-        if info:
-            return dev
-    return "en0"
-
-
 def amnezia_kill_switch() -> bool:
     plist = Path.home() / "Library/Preferences/org.amneziavpn.AmneziaVPN.plist"
     if not plist.exists():
@@ -158,21 +138,28 @@ def amnezia_kill_switch() -> bool:
         return False
 
 
+def describe_route(iface: str) -> str:
+    if not iface:
+        return "Торренты идут так, как решит система (VPN сейчас не найден)."
+    if net.is_tunnel(iface):
+        return f"Торренты идут через VPN ({iface})."
+    return f"Торренты идут напрямую через {iface}, мимо VPN."
+
+
 def cmd_vpn(args) -> None:
     ensure_running()
-    if args.mode == "status":
-        iface = call("info").get("bind_interface", "")
-        emit(args, {"via_vpn": not iface, "bind_interface": iface},
-             "Торренты идут через VPN." if not iface else f"Торренты идут напрямую через {iface}, мимо VPN.")
-        return
-    iface = "" if args.mode == "on" else physical_interface()
-    call("set", key="bind_interface", value=iface)
+    if args.mode != "status":
+        call("set", key="bind_interface", value=net.AUTO if args.mode == "on" else net.DIRECT)
+    i = call("info")
+    iface = i.get("active_interface", "")
+    via_vpn = net.is_tunnel(iface)
     warn = ""
-    if args.mode == "off" and amnezia_kill_switch():
+    if not via_vpn and i.get("bind_interface") == net.DIRECT and amnezia_kill_switch():
         warn = ("\n⚠︎ В AmneziaVPN включён kill switch: он блокирует трафик мимо VPN, "
-                "торренты так не пойдут. Выключи его в настройках Amnezia.")
-    emit(args, {"via_vpn": not iface, "bind_interface": iface, "kill_switch": bool(warn)},
-         ("Торренты идут через VPN." if not iface else f"Торренты идут напрямую через {iface}, мимо VPN.") + warn)
+                "торренты так не пойдут.")
+    emit(args, {"via_vpn": via_vpn, "mode": i.get("bind_interface"), "active_interface": iface,
+                "kill_switch_blocks": bool(warn)},
+         describe_route(iface) + warn)
     if warn and not args.json and not sys.stdout.isatty():
         subprocess.run(["osascript", "-e",
                         'display notification "В AmneziaVPN включён kill switch, мимо VPN торренты не пойдут" with title "Качалка"'])
