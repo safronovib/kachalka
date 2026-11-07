@@ -78,6 +78,8 @@ def render(cli: str) -> str:
         else:
             out.append("--" + action(cli, "Пауза", "pause", t["id"]))
         out.append("--" + action(cli, "Показать в Finder", "reveal", target, refresh=False))
+        out.append("--" + action(cli, "Разложить по папкам", "sort", t["id"]))
+        out.append("--" + action(cli, "Отменить раскладку", "undo", t["id"]))
         out.append("-----")
         out.append("--" + action(cli, "Убрать из списка (файлы оставить)", "rm", t["id"]))
         out.append("--" + action(cli, "Удалить вместе с файлами (в Корзину)", "rm", t["id"], "--files"))

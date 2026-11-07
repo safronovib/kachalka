@@ -23,7 +23,7 @@ from pathlib import Path
 
 import libtorrent as lt
 
-from . import __version__, net
+from . import __version__, net, sorter
 from .config import (
     LOG_PATH,
     PID_PATH,
@@ -93,6 +93,7 @@ class Engine:
         self.stopping = threading.Event()
         self.pending_trash: dict[str, Path] = {}   # hash -> путь, который надо унести в корзину после удаления
         self.pending_flush: dict[str, tuple] = {}  # hash -> (handle, когда начали), ждём сброса буфера
+        self.pending_moves: dict[str, dict] = {}   # hash -> идущее перемещение (раскладка или откат)
         self.manual_resume: set[str] = set()        # раздачи, которые владелец сам возобновил после лимита
         self.outstanding_resume = 0
         self.started_at = time.time()
@@ -190,6 +191,180 @@ class Engine:
         log.info("added %s %s", ih, st.name)
         return {"id": ih[:8], "hash": ih, "name": st.name or "(жду метаданные)", "save_path": save_path}
 
+    # --- этап 2: файлы, выбор серий, раскладка по папкам ---
+
+    @staticmethod
+    def _files(h) -> list[tuple[str, int]]:
+        fs = h.torrent_file().files()
+        return [(fs.file_path(i).replace(os.sep, "/"), fs.file_size(i)) for i in range(fs.num_files())]
+
+    def _one(self, ref: str):
+        hs = self.find(ref)
+        if len(hs) != 1:
+            raise ValueError("укажи одну раздачу (id или часть названия)")
+        return hs[0]
+
+    def files(self, ref: str) -> dict:
+        h = self._one(ref)
+        st = h.status()
+        if not st.has_metadata:
+            return {"id": hash_of(h)[:8], "name": st.name, "files": [], "note": "ещё жду метаданные"}
+        files = self._files(h)
+        prog = h.file_progress()
+        prio = h.get_file_priorities()
+        out = []
+        for i, (path, size) in enumerate(files):
+            if "/.pad/" in path:
+                continue
+            season, episode = sorter.episode_of(path)
+            out.append({
+                "index": i, "path": path, "size": size,
+                "progress": round(prog[i] * 100 / size, 1) if size else 100.0,
+                "selected": prio[i] > 0, "season": season, "episode": episode,
+            })
+        return {"id": hash_of(h)[:8], "name": st.name, "save_path": st.save_path, "files": out}
+
+    def select(self, ref: str, spec: dict) -> dict:
+        h = self._one(ref)
+        if not h.status().has_metadata:
+            self.store.pending_select_set(hash_of(h), spec)
+            return {"pending": True, "note": "выбор применится, когда придут метаданные"}
+        return self._apply_select(h, spec)
+
+    def _apply_select(self, h, spec: dict) -> dict:
+        """spec: {"mode": only|add|remove|all, "episodes": "4,5"} или {"files": [индексы]}."""
+        files = self._files(h)
+        mode = spec.get("mode", "only")
+        prios = list(h.get_file_priorities())
+        if mode == "all":
+            wanted = list(range(len(files)))
+        elif spec.get("episodes"):
+            wanted = sorter.match_episodes(files, sorter.parse_episodes(str(spec["episodes"])))
+            if not wanted:
+                raise ValueError(f"в раздаче не нашёл серии «{spec['episodes']}». Посмотри список: kachalka files")
+        else:
+            wanted = [int(i) for i in spec.get("files", []) if 0 <= int(i) < len(files)]
+            if not wanted:
+                raise ValueError("не указаны файлы")
+        if mode in ("only", "all"):
+            prios = [0] * len(files)
+        for i in wanted:
+            prios[i] = 0 if mode == "remove" else 4
+        h.prioritize_files(prios)
+        self._save_resume(h, force=True)
+        chosen = [files[i][0].split("/")[-1] for i, p in enumerate(prios) if p > 0 and "/.pad/" not in files[i][0]]
+        self.store.event(hash_of(h), "select", json.dumps(spec, ensure_ascii=False))
+        return {"selected": chosen, "count": len(chosen)}
+
+    def _library(self) -> tuple[str, dict]:
+        root = os.path.expanduser(self.cfg.get("library_dir") or self.cfg["download_dir"])
+        return root, {**sorter.DEFAULT_LIBRARY, **(self.cfg.get("library") or {})}
+
+    def sort(self, ref: str, dry_run: bool = False, overrides: dict | None = None) -> dict:
+        results = [self._sort_handle(h, dry_run, overrides) for h in self.find(ref)]
+        return {"results": results}
+
+    def _sort_handle(self, h, dry_run: bool = False, overrides: dict | None = None) -> dict:
+        st = h.status()
+        ih = hash_of(h)
+        if not st.has_metadata:
+            return {"id": ih[:8], "name": st.name, "skipped": "ещё нет метаданных"}
+        if ih in self.pending_moves:
+            return {"id": ih[:8], "name": st.name, "skipped": "уже перемещается"}
+        root, lib = self._library()
+        p = sorter.plan(st.name, self._files(h), st.save_path, root, lib, overrides)
+        res = {"id": ih[:8], "name": st.name, **p.as_dict(), "from": st.save_path}
+        if dry_run or p.note:
+            return res
+        move_id = self.store.move_start(ih, st.name, p.category, p.title, st.save_path, p.save_path,
+                                        [list(r) for r in p.renames])
+        res["move_id"] = move_id
+        self._start_move(h, move_id, st.save_path, p.save_path, list(p.renames), undo=False)
+        log.info("sort #%s %s → %s", move_id, st.name, p.save_path)
+        return res
+
+    def _start_move(self, h, move_id: int, src: str, dst: str, renames: list, undo: bool) -> None:
+        """renames — тройки (индекс, имя при раскладке «было», «стало») из журнала.
+        При раскладке файлы получают «стало», при откате — обратно «было»."""
+        ih = hash_of(h)
+        for i, old, new in renames:
+            h.rename_file(i, old if undo else new)
+        self.pending_moves[ih] = {"id": move_id, "from": src, "to": dst, "renames": renames, "undo": undo}
+        if os.path.normpath(src) == os.path.normpath(dst):
+            self._move_done(h, ih)
+            return
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        h.move_storage(dst, lt.move_flags_t.fail_if_exist)
+
+    def _move_done(self, h, ih: str) -> None:
+        m = self.pending_moves.pop(ih, None)
+        if not m:
+            return
+        self.store.move_set(m["id"], "undone" if m["undo"] else "done")
+        self.store.set_save_path(ih, m["to"])
+        self._save_resume(h, force=True)
+        # подчищаем опустевшие папки там, откуда уехали файлы
+        old_paths = {new if m["undo"] else old for _i, old, new in m["renames"] or []}
+        old_paths |= {p for p, _ in self._files(h)}  # у непереименованных файлов путь не менялся
+        for rel in old_paths:
+            self._prune(Path(m["from"]) / rel, base=m["from"])
+        self._prune(Path(m["from"]) / "_")  # сама старая папка (например, «Фильмы/Название (Год)» после отката)
+
+    def _move_failed(self, h, ih: str, error: str) -> None:
+        m = self.pending_moves.pop(ih, None)
+        if not m:
+            return
+        for i, old, new in m["renames"]:  # возвращаем имена, раз переезд не удался
+            h.rename_file(i, new if m["undo"] else old)
+        self.store.move_set(m["id"], "done" if m["undo"] else "failed", error)
+        log.error("move #%s failed: %s", m["id"], error)
+
+    def _prune(self, path: Path, base: str | None = None) -> None:
+        """Удаляет опустевшие папки вверх от файла. Работает только внутри библиотеки, папки
+        загрузок или (строго ниже) base — старой папки раздачи. Корни и папки категорий не трогает."""
+        root, lib = self._library()
+        downloads = os.path.expanduser(self.cfg["download_dir"])
+        protected = {os.path.normpath(p) for p in
+                     [root, downloads] + [os.path.join(root, v) for v in lib.values()] + ([base] if base else [])}
+        allowed = [os.path.normpath(root) + os.sep, os.path.normpath(downloads) + os.sep]
+        if base:
+            allowed.append(os.path.normpath(base) + os.sep)
+        d = path.parent
+        while any(str(d).startswith(a) for a in allowed) and os.path.normpath(str(d)) not in protected:
+            try:
+                entries = [e for e in os.listdir(d) if e != ".DS_Store"]
+                if entries:
+                    break
+                (d / ".DS_Store").unlink(missing_ok=True)
+                d.rmdir()
+            except OSError:
+                break
+            d = d.parent
+
+    def undo(self, ref: str) -> dict:
+        if ref.isdigit():
+            m = self.store.move_get(int(ref))
+            if not m:
+                raise ValueError(f"нет перемещения #{ref}")
+            h = self._one(m["info_hash"])
+        else:
+            h = self._one(ref)
+            m = self.store.last_move(hash_of(h))
+            if not m:
+                raise ValueError("эту раздачу ещё не раскладывали")
+        if m["status"] != "done":
+            raise ValueError(f"перемещение #{m['id']} в состоянии «{m['status']}», откатывать нечего")
+        ih = hash_of(h)
+        if ih in self.pending_moves:
+            raise ValueError("раздача сейчас перемещается, попробуй через минуту")
+        self.store.move_set(m["id"], "undoing")
+        self._start_move(h, m["id"], h.status().save_path, m["from_path"],
+                         [tuple(r) for r in m["renames"]], undo=True)
+        return {"move_id": m["id"], "name": m["name"], "back_to": m["from_path"]}
+
+    def moves(self, limit: int = 30) -> dict:
+        return {"moves": self.store.moves(limit)}
+
     @staticmethod
     def _download_torrent_file(url: str) -> str:
         req = urllib.request.Request(url, headers={"User-Agent": f"Kachalka/{__version__}"})
@@ -203,7 +378,18 @@ class Engine:
     def describe(self, h) -> dict:
         st = h.status()
         ih = hash_of(h)
-        left = max(st.total_wanted - st.total_wanted_done, 0)
+        size, done = st.total_wanted, st.total_wanted_done
+        selected_files = None
+        if st.has_metadata:
+            prios = h.get_file_priorities()
+            if 0 in prios:  # выбрана часть файлов: считаем по ним, libtorrent тут бывает неточен
+                fs = h.torrent_file().files()
+                prog = h.file_progress()
+                idx = [i for i, p in enumerate(prios) if p > 0]
+                size = sum(fs.file_size(i) for i in idx)
+                done = sum(prog[i] for i in idx)
+                selected_files = len(idx)
+        left = max(size - done, 0)
         eta = int(left / st.download_rate) if st.download_rate > 0 and left else None
         state = str(st.state).split(".")[-1]
         paused = is_paused(st)
@@ -214,9 +400,10 @@ class Engine:
             "name": st.name or ih,
             "state": "пауза" if paused else STATE_NAMES.get(state, state),
             "paused": paused,
-            "progress": round(st.progress * 100, 1),
-            "size": st.total_wanted,
-            "done": st.total_wanted_done,
+            "progress": round(done * 100 / size, 1) if size else round(st.progress * 100, 1),
+            "size": size,
+            "done": done,
+            "selected_files": selected_files,
             "down_rate": st.download_rate,
             "up_rate": st.upload_rate,
             "eta_seconds": eta,
@@ -347,6 +534,13 @@ class Engine:
             h = a.handle
             st = h.status()
             self.store.update_meta(hash_of(h), st.name, st.total_wanted)
+            spec = self.store.pending_select_pop(hash_of(h))
+            if spec:
+                try:
+                    self._apply_select(h, spec)
+                except ValueError as e:
+                    log.error("select after metadata: %s", e)
+                    notify("Качалка: не нашёл серии", f"{st.name}: {e}")
             self._save_resume(h, force=True)
         elif isinstance(a, lt.torrent_finished_alert):
             h = a.handle
@@ -355,8 +549,20 @@ class Engine:
             self._save_resume(h, force=True)
             if self.store.completed(ih):
                 log.info("finished %s %s", ih, st.name)
+                where = ""
+                if self.cfg.get("auto_sort", True):
+                    try:
+                        r = self._sort_handle(h)
+                        if r.get("move_id"):
+                            where = f" → {r['category_ru']}: {r['title']}"
+                    except Exception:
+                        log.exception("auto sort")
                 if self.cfg.get("notify", True):
-                    notify("Качалка: скачано", st.name)
+                    notify("Качалка: скачано", st.name + where)
+        elif isinstance(a, lt.storage_moved_alert):
+            self._move_done(a.handle, hash_of(a.handle))
+        elif isinstance(a, lt.storage_moved_failed_alert):
+            self._move_failed(a.handle, hash_of(a.handle), a.message())
         elif isinstance(a, lt.cache_flushed_alert):
             ih = hash_of(a.handle)
             if ih in self.pending_flush:
@@ -462,7 +668,22 @@ class Engine:
         if cmd == "info":
             return self.info()
         if cmd == "add":
-            return self.add(req["source"], req.get("save_path"))
+            res = self.add(req["source"], req.get("save_path"))
+            if req.get("episodes") or req.get("files"):
+                res["select"] = self.select(res["hash"], {"mode": "only", "episodes": req.get("episodes"),
+                                                          "files": req.get("files") or []})
+            return res
+        if cmd == "files":
+            return self.files(req["ref"])
+        if cmd == "select":
+            return self.select(req["ref"], {"mode": req.get("mode", "only"), "episodes": req.get("episodes"),
+                                            "files": req.get("files") or []})
+        if cmd == "sort":
+            return self.sort(req["ref"], bool(req.get("dry_run")), req.get("overrides"))
+        if cmd == "undo":
+            return self.undo(str(req["ref"]))
+        if cmd == "moves":
+            return self.moves(int(req.get("limit", 30)))
         if cmd == "list":
             return {"torrents": self.list()}
         if cmd == "pause":

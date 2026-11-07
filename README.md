@@ -4,7 +4,7 @@
 
 *A small libtorrent-based torrent client for macOS, built to be driven by an AI assistant: a background daemon, a JSON-friendly CLI, a SwiftBar menu-bar item and a Claude Code skill.*
 
-## Что умеет сейчас (этап 1)
+## Этап 1: загрузки
 
 - Качает magnet-ссылки, `.torrent`-файлы и ссылки на `.torrent` (движок libtorrent: DHT, LSD, UPnP/NAT-PMP, докачка).
 - Работает в фоне и сам запускается при входе в систему. После перезапуска продолжает с того же места.
@@ -14,10 +14,24 @@
 - Пишет историю в SQLite: что добавлено, когда скачано, куда легло, что удалено.
 - Навык для Claude Code: ассистент сам вызывает нужные команды.
 
+## Этап 2: порядок
+
+- **Раскладка по папкам.** Когда загрузка закончилась, Качалка распознаёт её по названию и файлам ([guessit](https://github.com/guessit-io/guessit) плюс типы файлов) и кладёт в библиотеку:
+  ```text
+  Фильмы/Total Recall (1990)/Total Recall (1990).mkv
+  Сериалы/Breaking Bad/Сезон 2/…
+  Музыка/…  Книги/…  Программы/…  Другое/…
+  ```
+  Переезд идёт через libtorrent (`move_storage`, `rename_file`), поэтому раздача не прерывается. Пустые папки после переезда подчищаются.
+- **Журнал и откат.** Каждая раскладка записана в журнал (`kachalka moves`), `kachalka undo` возвращает файлы на место со старыми именами.
+- **Поправки.** `kachalka sort <id> --title "Вспомнить всё" --year 1990` перекладывает под нужным названием, `--dry-run` только показывает план.
+- **Выбор серий.** `kachalka add <magnet> --episodes 4,5` качает только эти серии. У magnet выбор применяется, как только придут метаданные. Потом `kachalka select <id> --episodes 6 --add` докачивает ещё, `--remove` снимает, `--all` возвращает всё. Понимает `4,5`, `4-6`, `S02E04`, `2x4`, «Серия 7», «04 серия».
+
+Отключить автораскладку можно командой `kachalka set auto_sort false`. Папки переименовываются через настройку `library` в `config.json`, корень библиотеки задаёт `library_dir` (по умолчанию папка загрузок).
+
 ## Дальше
 
-- **Этап 2. Порядок.** Распознавание фильмов и сериалов по названию, раскладка по папкам, переименование, журнал с откатом.
-- **Этап 3. Чистка.** Правила вида «посмотрел и прошло 3 дня» или «не открывал месяц»: удаление в Корзину со списком на подтверждение.
+- **Этап 3. Просмотр.** Качалка узнаёт, что ты посмотрел (дата открытия файла в macOS, VLC). Режим «смотрю сериал» держит наготове N следующих серий и подкачивает их, а просмотренные убирает. Правила вида «посмотрел и прошло 3 дня» или «не открывал месяц» удаляют только в Корзину и со списком на подтверждение.
 - **Этап 4.** Окно со списком загрузок.
 
 ## Установка
@@ -28,7 +42,7 @@
 git clone https://github.com/safronovib/kachalka.git
 cd kachalka
 V="$HOME/Library/Application Support/Kachalka/venv"
-uv venv --python 3.13 "$V" && uv pip install --python "$V/bin/python" libtorrent
+uv venv --python 3.13 "$V" && uv pip install --python "$V/bin/python" -r requirements.txt
 PYTHONPATH="$PWD" "$V/bin/python" -m kachalka.cli install
 ```
 
@@ -39,7 +53,12 @@ PYTHONPATH="$PWD" "$V/bin/python" -m kachalka.cli install
 ## Команды
 
 ```text
-kachalka add <magnet|файл.torrent|url> [--to папка]
+kachalka add <magnet|файл.torrent|url> [--to папка] [--episodes 4,5]
+kachalka files <id>                # файлы и серии раздачи
+kachalka select <id> --episodes 6 [--add|--remove|--all]
+kachalka sort <id|all> [--dry-run] [--title … --year … --as series]
+kachalka undo <id|номер>           # откат раскладки
+kachalka moves                     # журнал раскладок
 kachalka list                      # что качается
 kachalka pause|resume <id|название|all>
 kachalka rm <id> [--files]         # --files: скачанное в Корзину

@@ -42,10 +42,18 @@ def cmd_add(args) -> None:
     results, errors = [], []
     for src in args.sources:
         try:
-            results.append(call("add", source=src, save_path=args.to))
+            results.append(call("add", source=src, save_path=args.to,
+                                episodes=getattr(args, "episodes", None)))
         except RuntimeError as e:
             errors.append({"source": src, "error": str(e)})
-    lines = [f"+ {r['name']}  [{r['id']}] → {r['save_path']}" for r in results]
+    lines = []
+    for r in results:
+        lines.append(f"+ {r['name']}  [{r['id']}] → {r['save_path']}")
+        sel = r.get("select")
+        if sel and sel.get("pending"):
+            lines.append(f"    серии {args.episodes}: выберу, когда придут метаданные")
+        elif sel:
+            lines.append(f"    качаю только: {', '.join(sel['selected'])}")
     lines += [f"✗ {e['source']}: {e['error']}" for e in errors]
     emit(args, {"added": results, "errors": errors}, "\n".join(lines))
     if errors and not results:
@@ -88,6 +96,73 @@ def cmd_simple(name: str, key: str, verb: str):
         items = res[key]
         emit(args, res, "\n".join(f"{verb}: {n}" for n in items) or "Ничего не изменилось.")
     return run
+
+
+def cmd_files(args) -> None:
+    ensure_running()
+    res = call("files", ref=args.ref)
+    lines = [f"[{res['id']}] {res['name']}"]
+    if res.get("note"):
+        lines.append(res["note"])
+    for f in res["files"]:
+        mark = "✓" if f["selected"] else "·"
+        ep = ""
+        if f["episode"] is not None:
+            ep = f"S{f['season']:02d}E{f['episode']:02d} " if f["season"] is not None else f"серия {f['episode']} "
+        lines.append(f"  {mark} {f['index']:>3}  {ep}{f['path'].split('/')[-1]}  {fmt.size(f['size'])}  {f['progress']:.0f}%")
+    emit(args, res, "\n".join(lines))
+
+
+def cmd_select(args) -> None:
+    ensure_running()
+    mode = "all" if args.all else "add" if args.add else "remove" if args.remove else "only"
+    files = [int(x) for x in args.files.split(",")] if args.files else []
+    if mode != "all" and not (args.episodes or files):
+        sys.exit("Укажи --episodes 4,5 или --files 3,7 (или --all)")
+    res = call("select", ref=args.ref, mode=mode, episodes=args.episodes, files=files)
+    if res.get("pending"):
+        emit(args, res, "Метаданных ещё нет — выберу, как только придут.")
+    else:
+        emit(args, res, f"Качаю {res['count']} файл(ов):\n  " + "\n  ".join(res["selected"]))
+
+
+def cmd_sort(args) -> None:
+    ensure_running()
+    overrides = {"category": args.as_, "title": args.title, "year": args.year, "season": args.season}
+    res = call("sort", ref=args.ref, dry_run=args.dry_run, overrides=overrides)
+    lines = []
+    for r in res["results"]:
+        if r.get("skipped"):
+            lines.append(f"· {r['name']}: {r['skipped']}")
+            continue
+        head = f"{r['category_ru']}: {r['title']}" + (f" ({r['year']})" if r.get("year") else "") + \
+               (f", сезон {r['season']}" if r.get("season") is not None else "")
+        if r.get("note"):
+            lines.append(f"· {r['name']} — {head}, {r['note']}")
+            continue
+        verb = "План" if args.dry_run else f"Раскладываю #{r['move_id']}"
+        lines.append(f"{verb}: {r['name']}\n    {head}\n    → {r['save_path']}")
+        shown = [rn for rn in r["renames"] if "/.pad/" not in rn["from"]]
+        for rn in shown[:5]:
+            lines.append(f"      {rn['from'].split('/')[-1]} → {rn['to']}")
+        if len(shown) > 5:
+            lines.append(f"      … и ещё {len(shown) - 5}")
+    emit(args, res, "\n".join(lines) or "Нечего раскладывать.")
+
+
+def cmd_undo(args) -> None:
+    ensure_running()
+    res = call("undo", ref=args.ref)
+    emit(args, res, f"Возвращаю #{res['move_id']} {res['name']} → {res['back_to']}")
+
+
+def cmd_moves(args) -> None:
+    ensure_running()
+    rows = call("moves", limit=args.limit)["moves"]
+    status = {"pending": "переезжает", "done": "разложено", "failed": "ошибка", "undoing": "возвращаю", "undone": "откачено"}
+    lines = [f"#{m['id']:<4} {fmt.when(m['at'])}  {status.get(m['status'], m['status']):11} {m['name']}\n"
+             f"       → {m['to_path']}" + (f"\n       ⚠︎ {m['error']}" if m.get("error") else "") for m in rows]
+    emit(args, {"moves": rows}, "\n".join(lines) or "Раскладок ещё не было.")
 
 
 def cmd_history(args) -> None:
@@ -302,6 +377,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("add", cmd_add, "добавить magnet, .torrent-файл или ссылку на .torrent")
     sp.add_argument("sources", nargs="+")
     sp.add_argument("--to", help="папка назначения (по умолчанию из настроек)")
+    sp.add_argument("--episodes", help="качать только эти серии: 4,5 / 4-6 / S02E04")
+    sp = add("files", cmd_files, "файлы раздачи: что выбрано, какие серии, сколько скачано")
+    sp.add_argument("ref")
+    sp = add("select", cmd_select, "выбрать, какие файлы или серии качать")
+    sp.add_argument("ref")
+    sp.add_argument("--episodes", help="4,5 / 4-6 / S02E04 / 2x4")
+    sp.add_argument("--files", help="индексы из kachalka files: 3,7")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--add", action="store_true", help="добавить к уже выбранному")
+    g.add_argument("--remove", action="store_true", help="перестать качать эти")
+    g.add_argument("--all", action="store_true", help="качать всё")
+    sp = add("sort", cmd_sort, "разложить по папкам (Фильмы, Сериалы…) и переименовать")
+    sp.add_argument("ref", help="id, часть названия или all")
+    sp.add_argument("--dry-run", action="store_true", help="только показать план")
+    sp.add_argument("--as", dest="as_", choices=["movie", "series", "music", "book", "software", "other"])
+    sp.add_argument("--title")
+    sp.add_argument("--year", type=int)
+    sp.add_argument("--season", type=int)
+    sp = add("undo", cmd_undo, "откатить раскладку: id раздачи или номер #перемещения")
+    sp.add_argument("ref")
+    sp = add("moves", cmd_moves, "журнал раскладок")
+    sp.add_argument("--limit", type=int, default=30)
     add("add-clipboard", cmd_add_clipboard, "добавить magnet из буфера обмена")
     add("list", cmd_list, "что качается и раздаётся", aliases=("ls",))
     for name, key, verb, aliases in (("pause", "paused", "Пауза", ()),

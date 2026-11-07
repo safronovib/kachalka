@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -26,6 +27,25 @@ CREATE TABLE IF NOT EXISTS events (
     detail    TEXT
 );
 CREATE INDEX IF NOT EXISTS events_hash ON events(info_hash);
+CREATE TABLE IF NOT EXISTS moves (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    info_hash  TEXT,
+    name       TEXT,
+    category   TEXT,
+    title      TEXT,
+    from_path  TEXT,
+    to_path    TEXT,
+    renames    TEXT,            -- JSON [[индекс, было, стало], …]
+    status     TEXT,            -- pending | done | failed | undoing | undone
+    at         TEXT,
+    done_at    TEXT,
+    error      TEXT
+);
+CREATE INDEX IF NOT EXISTS moves_hash ON moves(info_hash);
+CREATE TABLE IF NOT EXISTS pending_select (
+    info_hash TEXT PRIMARY KEY,
+    spec      TEXT              -- JSON {"episodes": "4,5"} или {"files": [1,2]}
+);
 """
 
 
@@ -80,6 +100,55 @@ class Store:
             (now(), int(trashed), info_hash),
         )
         self.event(info_hash, "removed", "files to trash" if trashed else "kept files")
+
+    # --- журнал перемещений (этап 2) ---
+
+    def move_start(self, info_hash: str, name: str, category: str, title: str,
+                   from_path: str, to_path: str, renames: list, status: str = "pending") -> int:
+        with self._lock:
+            cur = self._db.execute(
+                """INSERT INTO moves(info_hash, name, category, title, from_path, to_path, renames, status, at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (info_hash, name, category, title, from_path, to_path, json.dumps(renames, ensure_ascii=False), status, now()),
+            )
+            self._db.commit()
+            return int(cur.lastrowid)
+
+    def move_set(self, move_id: int, status: str, error: str = "") -> None:
+        self._exec("UPDATE moves SET status = ?, done_at = ?, error = ? WHERE id = ?", (status, now(), error, move_id))
+
+    def move_get(self, move_id: int) -> dict | None:
+        rows = self._exec("SELECT * FROM moves WHERE id = ?", (move_id,))
+        return self._move_row(rows[0]) if rows else None
+
+    def last_move(self, info_hash: str) -> dict | None:
+        rows = self._exec("SELECT * FROM moves WHERE info_hash = ? AND status = 'done' ORDER BY id DESC LIMIT 1", (info_hash,))
+        return self._move_row(rows[0]) if rows else None
+
+    def moves(self, limit: int = 30) -> list[dict]:
+        return [self._move_row(r) for r in self._exec("SELECT * FROM moves ORDER BY id DESC LIMIT ?", (limit,))]
+
+    @staticmethod
+    def _move_row(r) -> dict:
+        d = dict(r)
+        d["renames"] = json.loads(d["renames"] or "[]")
+        return d
+
+    def set_save_path(self, info_hash: str, path: str) -> None:
+        self._exec("UPDATE torrents SET save_path = ? WHERE info_hash = ?", (path, info_hash))
+
+    # --- выбор файлов до прихода метаданных ---
+
+    def pending_select_set(self, info_hash: str, spec: dict) -> None:
+        self._exec("INSERT OR REPLACE INTO pending_select(info_hash, spec) VALUES (?,?)",
+                   (info_hash, json.dumps(spec, ensure_ascii=False)))
+
+    def pending_select_pop(self, info_hash: str) -> dict | None:
+        rows = self._exec("SELECT spec FROM pending_select WHERE info_hash = ?", (info_hash,))
+        if not rows:
+            return None
+        self._exec("DELETE FROM pending_select WHERE info_hash = ?", (info_hash,))
+        return json.loads(rows[0]["spec"])
 
     def history(self, limit: int = 50) -> list[dict]:
         rows = self._exec("SELECT * FROM torrents ORDER BY added_at DESC LIMIT ?", (limit,))
