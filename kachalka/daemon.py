@@ -197,6 +197,9 @@ class Engine:
         self.store.added(ih, st.name or ih, source, save_path, size)
         self._save_resume(h, force=True)
         log.info("added %s %s", ih, st.name)
+        sorted_to = self._auto_sort_early(h)
+        if sorted_to:
+            save_path = sorted_to
         return {"id": ih[:8], "hash": ih, "name": st.name or "(жду метаданные)", "save_path": save_path}
 
     # --- этап 2: файлы, выбор серий, раскладка по папкам ---
@@ -289,6 +292,19 @@ class Engine:
         results = [self._sort_handle(h, dry_run, overrides) for h in self.find(ref)]
         return {"results": results}
 
+    def _auto_sort_early(self, h) -> str | None:
+        """Раскладываем сразу, как известен список файлов: качается уже в итоговую папку."""
+        if not self.cfg.get("auto_sort", True) or not h.status().has_metadata:
+            return None
+        if self.store.last_move(hash_of(h)):
+            return None
+        try:
+            r = self._sort_handle(h)
+            return r.get("save_path") if r.get("move_id") else None
+        except Exception:
+            log.exception("early sort")
+            return None
+
     def _sort_handle(self, h, dry_run: bool = False, overrides: dict | None = None) -> dict:
         st = h.status()
         ih = hash_of(h)
@@ -297,7 +313,8 @@ class Engine:
         if ih in self.pending_moves:
             return {"id": ih[:8], "name": st.name, "skipped": "уже перемещается"}
         root, lib = self._library()
-        p = sorter.plan(st.name, self._files(h), st.save_path, root, lib, overrides)
+        p = sorter.plan(st.name, self._files(h), st.save_path, root, lib, overrides,
+                        layout=self.cfg.get("layout", "flat"))
         res = {"id": ih[:8], "name": st.name, **p.as_dict(), "from": st.save_path}
         if dry_run or p.note:
             return res
@@ -578,6 +595,7 @@ class Engine:
                     log.error("select after metadata: %s", e)
                     notify("Качалка: не нашёл серии", f"{st.name}: {e}")
             self._save_resume(h, force=True)
+            self._auto_sort_early(h)
         elif isinstance(a, lt.torrent_finished_alert):
             h = a.handle
             st = h.status()

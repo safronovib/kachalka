@@ -191,13 +191,19 @@ def match_episodes(files: list[tuple[str, int]], wanted: list[tuple[int | None, 
 
 
 def plan(name: str, files: list[tuple[str, int]], current_save_path: str, library_root: str,
-         library: dict | None = None, overrides: dict | None = None) -> Plan:
+         library: dict | None = None, overrides: dict | None = None, layout: str = "flat") -> Plan:
     """Полный план: куда переложить раздачу и какие файлы переименовать.
 
     files — пути внутри раздачи (у многофайловой раздачи первый компонент — корневая папка).
+    layout:
+      "flat"   — одна папка на фильм или сериал прямо в корне: «Фильмы/Трудно быть богом/серии».
+                 Подпапки сезонов остаются, только если в раздаче их несколько.
+      "nested" — по типам: «Фильмы/…», «Сериалы/Название/Сезон N/…», «Музыка/…».
     """
     lib = {**DEFAULT_LIBRARY, **(library or {})}
     p = classify(name, files, overrides)
+    if layout == "flat":
+        return _plan_flat(p, files, current_save_path, library_root)
     base = posixpath.join(library_root, lib.get(p.category, lib["other"]))
     single = len(files) == 1 and "/" not in files[0][0]
     root = None if single else files[0][0].split("/", 1)[0]
@@ -236,6 +242,34 @@ def plan(name: str, files: list[tuple[str, int]], current_save_path: str, librar
             rename_root(p.title)
     else:
         p.save_path = base
+
+    if posixpath.normpath(p.save_path) == posixpath.normpath(current_save_path) and not p.renames:
+        p.note = "уже на месте"
+    return p
+
+
+def _plan_flat(p: Plan, files: list[tuple[str, int]], current_save_path: str, root_dir: str) -> Plan:
+    """Плоская раскладка: <корень>/<Название>/файлы — один клик до серий."""
+    single = len(files) == 1 and "/" not in files[0][0]
+    root = None if single else files[0][0].split("/", 1)[0]
+    if p.category == "movie":
+        label = f"{p.title} ({p.year})" if p.year else p.title
+    elif p.category == "series":
+        label = p.title
+    else:
+        label = None  # программы, музыка, книги: оставляем как есть, папкой раздачи в корне
+
+    p.save_path = root_dir
+    if label and single:
+        p.save_path = posixpath.join(root_dir, label)
+        if p.category == "movie":
+            new = label + _ext(files[0][0])
+            if new != files[0][0]:
+                p.renames.append((0, files[0][0], new))
+    elif label and root and root != label:
+        for i, (path, _) in enumerate(files):
+            if path.split("/", 1)[0] == root:
+                p.renames.append((i, path, label + path[len(root):]))
 
     if posixpath.normpath(p.save_path) == posixpath.normpath(current_save_path) and not p.renames:
         p.note = "уже на месте"
