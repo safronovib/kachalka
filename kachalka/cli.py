@@ -435,7 +435,7 @@ def cmd_install(args) -> None:
         for key in (f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN.name}",
                     f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN}",
                     f"NSStatusItem Preferred Position {SWIFTBAR_PLUGIN.resolve()}"):
-            subprocess.run(["defaults", "write", "com.ameba.SwiftBar", key, "-float", "420"], capture_output=True)
+            subprocess.run(["defaults", "write", "com.ameba.SwiftBar", key, "-float", "600"], capture_output=True)
 
     # 4. Окно (этап 4): build/Kachalka.app → ~/Applications
     app_src = ROOT / "build" / "Kachalka.app"
