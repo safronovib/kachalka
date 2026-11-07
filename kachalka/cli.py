@@ -42,8 +42,9 @@ def cmd_add(args) -> None:
     results, errors = [], []
     for src in args.sources:
         try:
+            follow = {"ahead": args.ahead} if getattr(args, "follow", False) else None
             results.append(call("add", source=src, save_path=args.to,
-                                episodes=getattr(args, "episodes", None)))
+                                episodes=getattr(args, "episodes", None), follow=follow))
         except RuntimeError as e:
             errors.append({"source": src, "error": str(e)})
     lines = []
@@ -51,7 +52,10 @@ def cmd_add(args) -> None:
         lines.append(f"+ {r['name']}  [{r['id']}] → {r['save_path']}")
         sel = r.get("select")
         if sel and sel.get("pending"):
-            lines.append(f"    серии {args.episodes}: выберу, когда придут метаданные")
+            what = "режим «смотрю сериал»" if args.follow else f"серии {args.episodes}"
+            lines.append(f"    {what}: включу, когда придут метаданные")
+        elif sel and sel.get("follow"):
+            lines.append(f"    смотрю сериал, держу наготове: {', '.join(sel['selected'])}")
         elif sel:
             lines.append(f"    качаю только: {', '.join(sel['selected'])}")
     lines += [f"✗ {e['source']}: {e['error']}" for e in errors]
@@ -163,6 +167,87 @@ def cmd_moves(args) -> None:
     lines = [f"#{m['id']:<4} {fmt.when(m['at'])}  {status.get(m['status'], m['status']):11} {m['name']}\n"
              f"       → {m['to_path']}" + (f"\n       ⚠︎ {m['error']}" if m.get("error") else "") for m in rows]
     emit(args, {"moves": rows}, "\n".join(lines) or "Раскладок ещё не было.")
+
+
+STATE_ICON = {"watched": "✓", "watching": "▶", "new": "·"}
+STATE_RU = {"watched": "посмотрено", "watching": "смотрю", "new": "не смотрел"}
+
+
+def _ep_label(f: dict) -> str:
+    if f.get("episode") is None:
+        return f["name"]
+    s = f"S{f['season']:02d}E{f['episode']:02d}" if f.get("season") is not None else f"серия {f['episode']}"
+    return s
+
+
+def cmd_watching(args) -> None:
+    ensure_running()
+    res = call("watching", ref=args.ref)
+    lines = []
+    for t in res["torrents"]:
+        lines.append(f"[{t['id']}] {t['name']}")
+        fl = t.get("follow")
+        cur = t.get("current")
+        if fl:
+            lines.append(f"    режим «смотрю сериал»: держу {fl['ahead']} серии вперёд"
+                         + (f", просмотренные убираю через {fl['keep_hours']:g} ч" if fl["cleanup"] else ""))
+        if cur and cur.get("done"):
+            lines.append("    всё досмотрено")
+        elif cur and cur.get("episode") is not None:
+            lines.append(f"    сейчас: {_ep_label(cur)}")
+        for f in t["files"]:
+            extra = []
+            if f["state"] == "watching":
+                extra.append(f"{f['watched_share']}%")
+            if f["trashed"]:
+                extra.append("в Корзине")
+            elif not f["exists"]:
+                extra.append("не скачано")
+            elif f["downloaded"] < 100:
+                extra.append(f"скачано {f['downloaded']}%" + ("" if f["selected"] else ", не качаю"))
+            lines.append(f"    {STATE_ICON[f['state']]} {_ep_label(f) if f['episode'] is not None else f['name']}"
+                         f"  {STATE_RU[f['state']]}" + (f" ({', '.join(extra)})" if extra else ""))
+    emit(args, res, "\n".join(lines) or "Видео в раздачах нет.")
+
+
+def cmd_watched(args) -> None:
+    ensure_running()
+    files = [int(x) for x in args.files.split(",")] if args.files else []
+    res = call("watched", ref=args.ref, episodes=args.episodes, files=files, watched=not args.unwatched)
+    verb = "Не смотрел" if args.unwatched else "Посмотрено"
+    emit(args, res, f"{verb}: " + ", ".join(res["marked"]))
+
+
+def cmd_follow(args) -> None:
+    ensure_running()
+    res = call("follow", ref=args.ref, ahead=args.ahead, keep_hours=args.keep_hours,
+               cleanup=not args.no_cleanup, from_ep=args.from_ep)
+    cur = res.get("current") or {}
+    head = "всё досмотрено" if cur.get("done") else f"сейчас {_ep_label(cur)}" if cur.get("episode") is not None else ""
+    emit(args, res, f"Смотрю «{res['name']}»: {head}\nДержу наготове: " + ", ".join(res.get("ready", [])))
+
+
+def cmd_unfollow(args) -> None:
+    ensure_running()
+    res = call("unfollow", ref=args.ref)
+    emit(args, res, f"Режим «смотрю сериал» выключен: {res['unfollowed']}")
+
+
+def cmd_cleanup(args) -> None:
+    ensure_running()
+    ids = args.ids.split(",") if args.ids else None
+    res = call("cleanup", apply=args.apply, ids=ids)
+    if args.apply:
+        items = res["trashed"]
+        emit(args, res, "В Корзину: " + ", ".join(i["name"] for i in items) if items else "Убирать нечего.")
+        return
+    items = res["candidates"]
+    if not items:
+        emit(args, res, "Убирать нечего.")
+        return
+    lines = [f"[{i['id']}] {i['name']}  {fmt.size(i['size'])}  — {i['reason']}" for i in items]
+    lines.append(f"Всего {fmt.size(sum(i['size'] for i in items))}. Убрать в Корзину: kachalka cleanup --apply [--ids …]")
+    emit(args, res, "\n".join(lines))
 
 
 def cmd_history(args) -> None:
@@ -378,6 +463,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("sources", nargs="+")
     sp.add_argument("--to", help="папка назначения (по умолчанию из настроек)")
     sp.add_argument("--episodes", help="качать только эти серии: 4,5 / 4-6 / S02E04")
+    sp.add_argument("--follow", action="store_true", help="режим «смотрю сериал»: качать по мере просмотра")
+    sp.add_argument("--ahead", type=int, help="сколько серий держать наготове (с --follow)")
+    sp = add("watching", cmd_watching, "что посмотрено, что смотрю, на какой серии остановился")
+    sp.add_argument("ref", nargs="?")
+    sp = add("watched", cmd_watched, "отметить посмотренным (или --unwatched)")
+    sp.add_argument("ref")
+    sp.add_argument("--episodes")
+    sp.add_argument("--files")
+    sp.add_argument("--unwatched", action="store_true")
+    sp = add("follow", cmd_follow, "режим «смотрю сериал»: подкачивать следующие серии, убирать просмотренные")
+    sp.add_argument("ref")
+    sp.add_argument("--ahead", type=int, help="сколько серий держать наготове после текущей (по умолчанию 2)")
+    sp.add_argument("--keep-hours", type=float, help="через сколько часов после просмотра убирать (по умолчанию 24)")
+    sp.add_argument("--no-cleanup", action="store_true", help="просмотренные не убирать")
+    sp.add_argument("--from", dest="from_ep", help="с какой серии начать, если ещё не смотрел: 4 или S02E04")
+    sp = add("unfollow", cmd_unfollow, "выключить режим «смотрю сериал»")
+    sp.add_argument("ref")
+    sp = add("cleanup", cmd_cleanup, "что можно убрать: давно посмотренное и не открытое")
+    sp.add_argument("--apply", action="store_true", help="убрать в Корзину")
+    sp.add_argument("--ids", help="только эти id через запятую")
     sp = add("files", cmd_files, "файлы раздачи: что выбрано, какие серии, сколько скачано")
     sp.add_argument("ref")
     sp = add("select", cmd_select, "выбрать, какие файлы или серии качать")

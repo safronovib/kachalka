@@ -42,6 +42,28 @@ CREATE TABLE IF NOT EXISTS moves (
     error      TEXT
 );
 CREATE INDEX IF NOT EXISTS moves_hash ON moves(info_hash);
+CREATE TABLE IF NOT EXISTS watch (
+    key             TEXT PRIMARY KEY,   -- info_hash:индекс файла
+    info_hash       TEXT,
+    idx             INTEGER,
+    path            TEXT,
+    duration        REAL,
+    vlc_pos         REAL,
+    watched_seconds REAL DEFAULT 0,
+    last_seen       TEXT,              -- когда последний раз видели открытым в плеере
+    watched_at      TEXT,              -- когда впервые стал «посмотрено»
+    manual          INTEGER DEFAULT 0, -- 1 = отмечено посмотренным, -1 = не смотрел
+    trashed_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS watch_hash ON watch(info_hash);
+CREATE TABLE IF NOT EXISTS follows (
+    info_hash  TEXT PRIMARY KEY,
+    ahead      INTEGER,            -- сколько серий держать наготове после текущей
+    keep_hours REAL,               -- через сколько часов после просмотра убирать серию
+    cleanup    INTEGER,            -- 1 = убирать просмотренные в Корзину
+    from_ep    TEXT,               -- с какой серии начинать, если ещё ничего не смотрел
+    created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS pending_select (
     info_hash TEXT PRIMARY KEY,
     spec      TEXT              -- JSON {"episodes": "4,5"} или {"files": [1,2]}
@@ -136,6 +158,37 @@ class Store:
 
     def set_save_path(self, info_hash: str, path: str) -> None:
         self._exec("UPDATE torrents SET save_path = ? WHERE info_hash = ?", (path, info_hash))
+
+    # --- просмотр (этап 3) ---
+
+    def watch_get(self, info_hash: str, idx: int) -> dict:
+        rows = self._exec("SELECT * FROM watch WHERE key = ?", (f"{info_hash}:{idx}",))
+        return dict(rows[0]) if rows else {"key": f"{info_hash}:{idx}", "info_hash": info_hash, "idx": idx}
+
+    def watch_for(self, info_hash: str) -> dict[int, dict]:
+        return {r["idx"]: dict(r) for r in self._exec("SELECT * FROM watch WHERE info_hash = ?", (info_hash,))}
+
+    def watch_put(self, rec: dict) -> None:
+        cols = ["key", "info_hash", "idx", "path", "duration", "vlc_pos", "watched_seconds",
+                "last_seen", "watched_at", "manual", "trashed_at"]
+        vals = [rec.get(c) for c in cols]
+        vals[cols.index("watched_seconds")] = rec.get("watched_seconds") or 0
+        vals[cols.index("manual")] = rec.get("manual") or 0
+        self._exec(f"INSERT OR REPLACE INTO watch({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", tuple(vals))
+
+    def follow_set(self, info_hash: str, ahead: int, keep_hours: float, cleanup: bool, from_ep: str | None) -> None:
+        self._exec("INSERT OR REPLACE INTO follows VALUES (?,?,?,?,?,?)",
+                   (info_hash, ahead, keep_hours, int(cleanup), from_ep, now()))
+
+    def follow_del(self, info_hash: str) -> None:
+        self._exec("DELETE FROM follows WHERE info_hash = ?", (info_hash,))
+
+    def follows(self) -> dict[str, dict]:
+        return {r["info_hash"]: dict(r) for r in self._exec("SELECT * FROM follows")}
+
+    def torrent(self, info_hash: str) -> dict | None:
+        rows = self._exec("SELECT * FROM torrents WHERE info_hash = ?", (info_hash,))
+        return dict(rows[0]) if rows else None
 
     # --- выбор файлов до прихода метаданных ---
 

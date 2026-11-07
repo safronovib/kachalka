@@ -40,6 +40,7 @@ def render(cli: str) -> str:
         torrents = call("list", timeout=3)["torrents"]
         history = call("history", timeout=3, limit=20)["history"]
         info = call("info", timeout=3)
+        cleanup = call("cleanup", timeout=5, max_age=300).get("candidates", [])
         iface = info.get("active_interface", "")
         direct_mode = info.get("bind_interface") == net.DIRECT
     except (NotRunning, OSError, RuntimeError, ValueError):
@@ -83,7 +84,8 @@ def render(cli: str) -> str:
         out.append("-----")
         out.append("--" + action(cli, "Убрать из списка (файлы оставить)", "rm", t["id"]))
         out.append("--" + action(cli, "Удалить вместе с файлами (в Корзину)", "rm", t["id"], "--files"))
-        out.append(f"{fmt.bar(t['progress'])}  {int(t['progress'])}% · {t['state']}")
+        out.append(f"{fmt.bar(t['progress'])}  {int(t['progress'])}% · {t['state']}"
+                   + (" · смотрю сериал" if t.get("follow") else ""))
         if t["state"] == "качается":
             out.append(f"{fmt.size(t['done'])} из {fmt.size(t['size'])} · {fmt.speed(t['down_rate'])}")
             if t["eta_seconds"] is not None:
@@ -95,6 +97,14 @@ def render(cli: str) -> str:
             out.append(f"⚠︎ {_clean(t['error'])} | color=red")
         out.append("---")
 
+    if cleanup:
+        total = sum(c["size"] for c in cleanup)
+        out.append(f"Можно освободить {fmt.size(total)} ({len(cleanup)}) | size=12")
+        for c in cleanup:
+            out.append(f"--{_clean(c['name'])[:50]} — {_clean(c['reason'])}")
+            out.append("----" + action(cli, "Убрать в Корзину", "cleanup", "--apply", "--ids", c["id"]))
+        out.append("--" + action(cli, "Убрать всё это в Корзину", "cleanup", "--apply"))
+        out.append("---")
     if direct_mode:
         out.append(f"Сеть: напрямую ({iface}), мимо VPN | size=12")
         out.append(action(cli, "Пустить через VPN", "vpn", "on"))

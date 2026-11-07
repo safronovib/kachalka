@@ -86,9 +86,13 @@ def move_to_trash(path: Path) -> bool:
 # ---------- ядро ----------
 
 class Engine:
+    hash_of = staticmethod(hash_of)
+
     def __init__(self) -> None:
+        from .viewer import Viewer
         self.cfg = load_config()
         self.store = Store(DB_PATH)
+        self.viewer = Viewer(self)
         self.lock = threading.RLock()
         self.stopping = threading.Event()
         self.pending_trash: dict[str, Path] = {}   # hash -> путь, который надо унести в корзину после удаления
@@ -195,8 +199,15 @@ class Engine:
 
     @staticmethod
     def _files(h) -> list[tuple[str, int]]:
+        """Текущие пути файлов внутри раздачи. torrent_file() в Python-обёртке отдаёт исходные
+        имена и не видит rename_file, поэтому накладываем get_renamed_files()."""
         fs = h.torrent_file().files()
-        return [(fs.file_path(i).replace(os.sep, "/"), fs.file_size(i)) for i in range(fs.num_files())]
+        try:
+            rf = h.get_renamed_files()
+            path = lambda i: rf.file_path(fs, i)
+        except Exception:
+            path = fs.file_path
+        return [(path(i).replace(os.sep, "/"), fs.file_size(i)) for i in range(fs.num_files())]
 
     def _one(self, ref: str):
         hs = self.find(ref)
@@ -232,9 +243,19 @@ class Engine:
         return self._apply_select(h, spec)
 
     def _apply_select(self, h, spec: dict) -> dict:
-        """spec: {"mode": only|add|remove|all, "episodes": "4,5"} или {"files": [индексы]}."""
+        """spec: {"mode": only|add|remove|all|keep, "episodes": "4,5"} или {"files": [индексы]},
+        плюс необязательный "follow": {...} — включить режим «смотрю сериал»."""
+        follow = spec.get("follow")
+        if follow:
+            res = self.viewer.follow(h, int(follow.get("ahead") or self.cfg.get("follow_ahead", 2)),
+                                     float(follow.get("keep_hours") if follow.get("keep_hours") is not None
+                                           else self.cfg.get("follow_keep_hours", 24)),
+                                     bool(follow.get("cleanup", True)), follow.get("from_ep"))
+            return {"selected": res.get("ready", []), "count": len(res.get("ready", [])), "follow": True}
         files = self._files(h)
         mode = spec.get("mode", "only")
+        if mode == "keep":
+            return {"selected": [], "count": 0}
         prios = list(h.get_file_priorities())
         if mode == "all":
             wanted = list(range(len(files)))
@@ -404,6 +425,7 @@ class Engine:
             "size": size,
             "done": done,
             "selected_files": selected_files,
+            "follow": ih in self.store.follows(),
             "down_rate": st.download_rate,
             "up_rate": st.upload_rate,
             "eta_seconds": eta,
@@ -447,7 +469,15 @@ class Engine:
             if trash_files and st.name:
                 # Сначала останавливаем раздачу и дожидаемся, пока libtorrent допишет буфер на диск
                 # (cache_flushed_alert). Иначе поздняя запись создаст файл заново после Корзины.
-                self.pending_trash[ih] = Path(st.save_path) / st.name
+                # Верхние элементы раздачи по ТЕКУЩИМ путям (после раскладки корень мог
+                # называться «Сезон 1», а файл — «Название (Год).mkv»)
+                tops = []
+                if st.has_metadata:
+                    for rel, _ in self._files(h):
+                        top = rel.split("/", 1)[0]
+                        if top != ".pad" and top not in tops:
+                            tops.append(top)
+                self.pending_trash[ih] = [Path(st.save_path) / t for t in (tops or [st.name])]
                 self.pending_flush[ih] = (h, time.time())
                 h.unset_flags(lt.torrent_flags.auto_managed)
                 h.pause()
@@ -591,15 +621,19 @@ class Engine:
         elif isinstance(a, lt.add_torrent_alert) and a.error.value():
             log.error("restore failed: %s", a.message())
 
-    def _trash_later(self, ih: str, path: Path) -> None:
-        ok = move_to_trash(path)
+    def _trash_later(self, ih: str, paths: list[Path]) -> None:
+        ok = False
+        for path in paths:
+            ok = move_to_trash(path) or ok
         # Контроль: если запоздалая запись всё же создала файл заново, это мусор — тоже в Корзину
         time.sleep(3)
-        if ok and path.exists():
-            log.warning("file reappeared after trash, trashing again: %s", path)
-            move_to_trash(path)
+        for path in paths:
+            if path.exists():
+                log.warning("file reappeared after trash, trashing again: %s", path)
+                move_to_trash(path)
+            self._prune(path)  # опустевшие «Фильмы/Название (Год)», «Сериалы/Название» и т. п.
         self.store.removed(ih, trashed=ok)
-        log.info("trashed=%s %s", ok, path)
+        log.info("trashed=%s %s", ok, [str(p) for p in paths])
 
     def periodic(self) -> None:
         # VPN переподключился (сменился utunN) или включился/выключился — перепривязываемся
@@ -644,6 +678,10 @@ class Engine:
                     self.periodic()
                 except Exception:
                     log.exception("periodic")
+            try:
+                self.viewer.tick()
+            except Exception:
+                log.exception("viewer")
         self._shutdown()
 
     def _shutdown(self) -> None:
@@ -669,10 +707,41 @@ class Engine:
             return self.info()
         if cmd == "add":
             res = self.add(req["source"], req.get("save_path"))
-            if req.get("episodes") or req.get("files"):
-                res["select"] = self.select(res["hash"], {"mode": "only", "episodes": req.get("episodes"),
-                                                          "files": req.get("files") or []})
+            follow = req.get("follow")
+            if follow:
+                follow.setdefault("from_ep", req.get("episodes"))
+            if req.get("episodes") or req.get("files") or follow:
+                res["select"] = self.select(res["hash"], {
+                    "mode": "only" if (req.get("episodes") or req.get("files")) else "keep",
+                    "episodes": req.get("episodes"), "files": req.get("files") or [], "follow": follow})
             return res
+        if cmd == "watching":
+            hs = self.find(req["ref"]) if req.get("ref") else self.handles()
+            items = [self.viewer.status(h) for h in hs]
+            return {"torrents": [i for i in items if i["files"]]}
+        if cmd == "watched":
+            return {"marked": self.viewer.mark(self._one(req["ref"]), req.get("episodes"),
+                                               req.get("files") or [], bool(req.get("watched", True)))}
+        if cmd == "follow":
+            return self.viewer.follow(self._one(req["ref"]),
+                                      int(req.get("ahead") or self.cfg.get("follow_ahead", 2)),
+                                      float(req.get("keep_hours") if req.get("keep_hours") is not None
+                                            else self.cfg.get("follow_keep_hours", 24)),
+                                      bool(req.get("cleanup", True)), req.get("from_ep"))
+        if cmd == "unfollow":
+            h = self._one(req["ref"])
+            self.viewer.unfollow(h)
+            return {"unfollowed": h.status().name}
+        if cmd == "cleanup":
+            cands = self.viewer.cleanup_candidates(max_age=float(req.get("max_age") or 0))
+            if req.get("apply"):
+                ids = set(req.get("ids") or [c["id"] for c in cands])
+                chosen = [c for c in cands if c["id"] in ids]
+                for c in chosen:
+                    self.remove(c["id"], trash_files=True)
+                self.viewer._cand_cache = None
+                return {"trashed": chosen}
+            return {"candidates": cands}
         if cmd == "files":
             return self.files(req["ref"])
         if cmd == "select":
