@@ -586,7 +586,8 @@ class Engine:
             if self.store.completed(ih):
                 log.info("finished %s %s", ih, st.name)
                 where = ""
-                if self.cfg.get("auto_sort", True):
+                # уже разложенное вручную (например, под русским названием) не перекладываем
+                if self.cfg.get("auto_sort", True) and not self.store.last_move(ih):
                     try:
                         r = self._sort_handle(h)
                         if r.get("move_id"):
