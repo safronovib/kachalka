@@ -39,6 +39,7 @@ def render(cli: str) -> str:
     try:
         torrents = call("list", timeout=3)["torrents"]
         history = call("history", timeout=3, limit=20)["history"]
+        iface = call("info", timeout=3).get("bind_interface", "")
     except (NotRunning, OSError, RuntimeError, ValueError):
         return ""
 
@@ -90,6 +91,13 @@ def render(cli: str) -> str:
             out.append(f"⚠︎ {_clean(t['error'])} | color=red")
         out.append("---")
 
+    if iface:
+        out.append(f"Сеть: напрямую ({iface}), мимо VPN | size=12")
+        out.append(action(cli, "Пустить через VPN", "vpn", "on"))
+    else:
+        out.append("Сеть: через VPN | size=12")
+        out.append(action(cli, "Пустить мимо VPN", "vpn", "off"))
+    out.append("---")
     out.append(action(cli, "Добавить magnet из буфера обмена", "add-clipboard"))
     out.append(action(cli, "Пауза всех", "pause", "all"))
     out.append(action(cli, "Продолжить все", "resume", "all"))

@@ -99,12 +99,8 @@ class Engine:
         self._metric_index = {m.name: m.value_index for m in lt.session_stats_metrics()}
         self.net_errors: list[str] = []             # последние сетевые ошибки для diag
 
-        port = int(self.cfg["listen_port"])
-        iface = (self.cfg.get("bind_interface") or "").strip()
-        net = ({"listen_interfaces": f"{iface}:{port}", "outgoing_interfaces": iface} if iface
-               else {"listen_interfaces": f"0.0.0.0:{port},[::]:{port}"})
         self.ses = lt.session({
-            **net,
+            **self._net_settings(),
             "alert_mask": lt.alert_category.status | lt.alert_category.error | lt.alert_category.storage,
             "enable_dht": True,
             "dht_bootstrap_nodes": "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
@@ -117,6 +113,14 @@ class Engine:
             "upload_rate_limit": int(self.cfg["upload_limit_kbps"]) * 1024,
         })
         self._load_resume()
+
+    def _net_settings(self) -> dict:
+        """Через какой интерфейс идёт торрент-трафик. Пусто = как вся система (обычно через VPN)."""
+        port = int(self.cfg["listen_port"])
+        iface = (self.cfg.get("bind_interface") or "").strip()
+        if iface:
+            return {"listen_interfaces": f"{iface}:{port}", "outgoing_interfaces": iface}
+        return {"listen_interfaces": f"0.0.0.0:{port},[::]:{port}", "outgoing_interfaces": ""}
 
     # --- восстановление после перезапуска ---
 
@@ -305,6 +309,7 @@ class Engine:
             "uptime_seconds": int(time.time() - self.started_at),
             "download_dir": self.cfg["download_dir"],
             "listen_port": self.ses.listen_port(),
+            "bind_interface": self.cfg.get("bind_interface") or "",
             "dht_nodes": dht,
             "down_rate": s.payload_download_rate,
             "up_rate": s.payload_upload_rate,
@@ -443,7 +448,9 @@ class Engine:
                 raise ValueError(f"нет такой настройки: {key}")
             self.cfg[key] = value
             save_config(self.cfg)
-            return {"config": self.cfg, "note": "listen_port применится после перезапуска"}
+            if key in ("bind_interface", "listen_port"):
+                self.ses.apply_settings(self._net_settings())  # сокеты переоткрываются сразу
+            return {"config": self.cfg}
         if cmd == "shutdown":
             self.stopping.set()
             return {"stopping": True}

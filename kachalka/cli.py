@@ -128,6 +128,56 @@ def cmd_info(args) -> None:
          f"Раздач: {i['torrents']}, ↓{fmt.speed(i['down_rate'])} ↑{fmt.speed(i['up_rate'])}")
 
 
+TUNNEL_PREFIXES = ("utun", "ipsec", "ppp", "tun", "tap", "wg")
+
+
+def physical_interface() -> str:
+    """Основной физический интерфейс (Wi-Fi или Ethernet), даже когда VPN включён."""
+    out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if line.strip().startswith("interface:"):
+            iface = line.split(":", 1)[1].strip()
+            if not iface.startswith(TUNNEL_PREFIXES):
+                return iface
+    ports = subprocess.run(["networksetup", "-listallhardwareports"], capture_output=True, text=True).stdout
+    devices = [l.split(":", 1)[1].strip() for l in ports.splitlines() if l.startswith("Device:")]
+    for dev in devices:
+        info = subprocess.run(["ipconfig", "getifaddr", dev], capture_output=True, text=True).stdout.strip()
+        if info:
+            return dev
+    return "en0"
+
+
+def amnezia_kill_switch() -> bool:
+    plist = Path.home() / "Library/Preferences/org.amneziavpn.AmneziaVPN.plist"
+    if not plist.exists():
+        return False
+    try:
+        return bool(plistlib.loads(plist.read_bytes()).get("Conf.killSwitchEnabled"))
+    except Exception:
+        return False
+
+
+def cmd_vpn(args) -> None:
+    ensure_running()
+    if args.mode == "status":
+        iface = call("info").get("bind_interface", "")
+        emit(args, {"via_vpn": not iface, "bind_interface": iface},
+             "Торренты идут через VPN." if not iface else f"Торренты идут напрямую через {iface}, мимо VPN.")
+        return
+    iface = "" if args.mode == "on" else physical_interface()
+    call("set", key="bind_interface", value=iface)
+    warn = ""
+    if args.mode == "off" and amnezia_kill_switch():
+        warn = ("\n⚠︎ В AmneziaVPN включён kill switch: он блокирует трафик мимо VPN, "
+                "торренты так не пойдут. Выключи его в настройках Amnezia.")
+    emit(args, {"via_vpn": not iface, "bind_interface": iface, "kill_switch": bool(warn)},
+         ("Торренты идут через VPN." if not iface else f"Торренты идут напрямую через {iface}, мимо VPN.") + warn)
+    if warn and not args.json and not sys.stdout.isatty():
+        subprocess.run(["osascript", "-e",
+                        'display notification "В AmneziaVPN включён kill switch, мимо VPN торренты не пойдут" with title "Качалка"'])
+
+
 def cmd_diag(args) -> None:
     ensure_running()
     print(json.dumps(call("diag"), ensure_ascii=False, indent=2))
@@ -287,6 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
     add("stop", cmd_stop, "остановить фоновую программу")
     add("restart", cmd_restart, "перезапустить фоновую программу (например, после обновления кода)")
     add("diag", cmd_diag, "сетевая диагностика: DHT, трекеры, ошибки")
+    sp = add("vpn", cmd_vpn, "торренты через VPN (on) или напрямую мимо него (off)")
+    sp.add_argument("mode", choices=["on", "off", "status"])
     add("daemon", cmd_daemon, "запустить фоновую программу в этом окне (для отладки)")
     sp = add("reveal", cmd_reveal, "показать файл в Finder (без аргумента — папку загрузок)")
     sp.add_argument("target", nargs="?")

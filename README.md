@@ -46,8 +46,14 @@ kachalka rm <id> [--files]         # --files: скачанное в Корзин
 kachalka history
 kachalka limit --down 5000 --up 500   # КБ/с, 0 = без ограничений
 kachalka set download_dir "~/Movies/Торренты"
-kachalka info | start | stop
+kachalka vpn on|off|status         # торренты через VPN или напрямую мимо него
+kachalka diag                      # почему не качается: DHT, трекеры, ошибки
+kachalka info | start | stop | restart
 ```
+
+### VPN
+
+Многие VPN-серверы режут торрент-трафик. Тогда magnet-ссылки висят на «ищу метаданные», а `kachalka diag` показывает растущий `dht_messages_out_dropped`. `kachalka vpn off` (или пункт меню «Пустить мимо VPN») привязывает Качалку к Wi-Fi или Ethernet, и торренты идут напрямую, а весь остальной трафик по-прежнему через VPN. Если в VPN включён kill switch, он заблокирует и это. Качалка предупредит, когда видит kill switch у AmneziaVPN.
 
 У каждой команды есть `--json` для машинного чтения.
 
