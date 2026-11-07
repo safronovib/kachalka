@@ -375,6 +375,11 @@ def cmd_reveal(args) -> None:
         subprocess.run(["open", str(p.parent)])
 
 
+def cmd_swiftbar_dismiss(args) -> None:
+    from .swiftbar import dismiss
+    dismiss()
+
+
 def cmd_swiftbar(args) -> None:
     from .swiftbar import render
     sys.stdout.write(render(str(CLI)))
@@ -559,6 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target", nargs="?")
     sp.add_argument("--downloads", action="store_true")
     add("swiftbar", cmd_swiftbar, "вывод для плагина SwiftBar")
+    add("swiftbar-dismiss", cmd_swiftbar_dismiss, "убрать «✓ скачано» из строки меню")
     sp = add("install", cmd_install, "автозапуск, значок SwiftBar, навык Claude, команда в PATH")
     sp.add_argument("--no-swiftbar", action="store_true")
     sp.add_argument("--no-skill", action="store_true")

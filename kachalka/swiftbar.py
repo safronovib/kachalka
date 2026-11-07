@@ -11,8 +11,21 @@ from pathlib import Path
 
 from . import fmt, net
 from .client import NotRunning, call
+from .config import APP_DIR
 
-DONE_VISIBLE_SECONDS = 600
+
+def dismiss() -> None:
+    DISMISS_FILE.write_text(datetime.now(timezone.utc).isoformat())
+
+
+def _dismissed_at() -> datetime | None:
+    try:
+        return datetime.fromisoformat(DISMISS_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+DONE_VISIBLE_SECONDS = 180  # «✓ скачано» висит 3 минуты, как у монтажа
+DISMISS_FILE = APP_DIR / "swiftbar-dismissed"  # «Скрыть»: время, до которого готовое не показываем
 ACTIVE = {"качается", "ищу метаданные", "проверка", "выделяю место", "в очереди"}
 
 
@@ -68,10 +81,12 @@ def _render(cli: str) -> str:
 
     active = [t for t in torrents if t["state"] in ACTIVE]
     now = datetime.now(timezone.utc)
+    hidden_before = _dismissed_at()
     recent_done = [
         h for h in history
         if h.get("completed_at") and not h.get("removed_at")
         and (now - datetime.fromisoformat(h["completed_at"])).total_seconds() < DONE_VISIBLE_SECONDS
+        and not (hidden_before and datetime.fromisoformat(h["completed_at"]) <= hidden_before)
     ]
     if not active and not recent_done:
         return ""
@@ -88,6 +103,9 @@ def _render(cli: str) -> str:
     else:
         out.append("⬇ ✓ скачано")
     out.append("---")
+    if not active:
+        out.append(action(cli, "Скрыть «скачано»", "swiftbar-dismiss"))
+        out.append("---")
 
     for t in torrents:
         name = _clean(t["name"])
